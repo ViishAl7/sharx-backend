@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id          Int     @id @default(autoincrement())
+  name        String
+  email       String  @unique
+  password    String?
+  googleId    String? @unique
+  avatar      String?
+  score       Int     @default(0)
+  microsoftId String? @unique
+  matches     Match[]
+}
+
+model Match {
+  id        Int      @id @default(autoincrement())
+  result    String
+  score     Int
+  createdAt DateTime @default(now())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+}
