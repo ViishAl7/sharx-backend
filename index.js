@@ -155,7 +155,7 @@ img { border: 0; display: block; }
               <a href="#">Security</a>
             </div>
             <div class="footer-copy">
-              © ${year} Sharx. All rights reserved.<br>
+              © ${year} Playvora. All rights reserved.<br>
               This is an automated message. Please do not reply.
             </div>
           </td>
@@ -196,29 +196,36 @@ app.use("/user", userRoutes);
 app.use("/auth", authRoutes);
 app.use("/passkey", passkeyRoutes);
 
-// ─────────────────────────────────────────
-// GAMES ENDPOINT
-// ─────────────────────────────────────────
+// simple in-memory cache, 5 min ke liye
+const gamesCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
+
 app.get("/games", async (req, res) => {
   try {
     const { page = 1, num = 50 } = req.query;
+    const cacheKey = `${page}-${num}`;
+    const cached = gamesCache.get(cacheKey);
+
+    if (cached && Date.now() - cached.time < CACHE_TTL) {
+      return res.json(cached.data);
+    }
 
     const response = await axios.get(
       `https://gamemonetize.com/feed.php?format=0&num=${num}&page=${page}`
     );
 
-    res.json({
-      success: true,
-      page: parseInt(page),
-      num: parseInt(num),
-      games: Array.isArray(response.data) ? response.data : response.data,
-    });
+    const games = Array.isArray(response.data) ? response.data : [];
+    gamesCache.set(cacheKey, { data: games, time: Date.now() });
+
+    res.json(games); // ✅ ab direct array bhej rahe hain, object nahi
   } catch (error) {
     console.error("Games fetch error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch games from GameMonetize"
-    });
+    // agar GameMonetize down/rate-limited hai, purana cache use kar le agar hai
+    const cacheKey = `${req.query.page || 1}-${req.query.num || 50}`;
+    const stale = gamesCache.get(cacheKey);
+    if (stale) return res.json(stale.data);
+
+    res.status(500).json({ success: false, message: "Failed to fetch games" });
   }
 });
 
