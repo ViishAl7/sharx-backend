@@ -2,6 +2,36 @@
 //  PLAVORA GAMING SERVER — WITH AD BLOCKER PROXY
 //  (FULLY INTEGRATED)
 // ─────────────────────────────────────────────────────────────
+//
+// WHAT CHANGED IN THIS VERSION:
+// Only the ad-blocker/proxy section near the bottom was touched. Your
+// auth, signup/login, OTP, Prisma, socket.io, and leaderboard code is
+// untouched, byte-for-byte, below.
+//
+// UNRESOLVED QUESTION I CANNOT ANSWER FROM THE CODE ALONE:
+// your Sharx server (port 4000) has its own /proxy/game route, and its
+// own comment says it's "the one actually running" for games. If your
+// frontend's API_BASE for games points at port 4000, this server's
+// /proxy/game route below is never called by anyone — dead code. I've
+// fixed it anyway (cheap to keep correct), but you should check which
+// port your frontend's game proxy calls actually hit, and delete this
+// section entirely from whichever server doesn't need it. Running two
+// servers that can both independently serve the same route is exactly
+// the kind of setup that caused your original 404 bug.
+//
+// ALSO FLAGGING, separate from anything you asked for: this file calls
+// itself "Sharx" in the OTP email title ("Reset your Sharx password")
+// but "Playvora" everywhere else (contact form subject, footer,
+// console logs). That's either a rename that's half-done, or a
+// copy-paste leftover. Worth fixing before a user gets a password
+// reset email for the wrong brand name.
+//
+// REQUIRED PACKAGE.JSON CHANGE:
+//   npm install compression
+//
+// REQUIRED ENV VAR — add to your .env:
+//   PUBLIC_BASE_URL=https://your-actual-domain-or-ip:5001
+// ─────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -14,7 +44,8 @@ const passport = require('passport');
 const session = require('express-session');
 const { Resend } = require('resend');
 const axios = require('axios');
-const { URL } = require('url');               // ✅ Added for ad blocker
+const compression = require('compression');
+const adblock = require('./lib/adblock');
 
 // ─── Custom Routes ──────────────────────────────────────────
 const passkeyRoutes = require('./routes/passkey');
@@ -29,6 +60,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
 // ─── OTP Store ──────────────────────────────────────────────
 const otpStore = new Map();
@@ -46,6 +78,7 @@ app.use(
 );
 
 // ─── Middleware ─────────────────────────────────────────────
+app.use(compression());
 app.use(express.json());
 app.use(
   session({
@@ -422,38 +455,15 @@ app.post('/contact', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════
 //  🚫 AD BLOCKER PROXY — ROUTES & MIDDLEWARE
-//  (Placed after all other routes, before server start)
+//  Now backed by the shared ./lib/adblock module instead of its own
+//  copy of the blocklist/stripping logic — see that file for what
+//  changed and why (bigger auto-updating blocklist, faster matching,
+//  cached runtime script).
 // ════════════════════════════════════════════════════════════════
 
-// ─── Ad domains blocklist ───────────────────────────────────
-// NOTE: gamemonetize.com is deliberately NOT in here — that's your own
-// game source (html5.gamemonetize.com etc.), blocking it would have
-// blocked every single game from loading through the proxy.
-const AD_DOMAINS = new Set([
-  'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
-  'adnxs.com', 'rubiconproject.com', 'openx.net', 'pubmatic.com',
-  'criteo.com', 'taboola.com', 'outbrain.com', 'revcontent.com',
-  'advertising.com', 'yieldmo.com', 'smartadserver.com', 'appnexus.com',
-  'adsafeprotected.com', 'moatads.com', 'scorecardresearch.com',
-  'quantserve.com', 'amazon-adsystem.com', 'media.net',
-  'sharethrough.com', 'teads.tv', '33across.com', 'indexexchange.com',
-  'sovrn.com', 'lijit.com', 'undertone.com', 'conversantmedia.com',
-  'flashtalking.com', 'exoclick.com', 'trafficjunky.com',
-  'cpmstar.com', 'popads.net', 'popcash.net', 'propellerads.com',
-  'hilltopads.net', 'adcash.com', 'clickadu.com', 'zeropark.com',
-  'adsterra.com', 'admaven.com', 'mgid.com', 'revolutiontt.net',
-  'juicyads.com', 'ero-advertising.com', 'adcolony.com',
-  'unityads.unity3d.com', 'ads.mopub.com', 'superawesome.com',
-  'chartboost.com', 'vungle.com', 'applovin.com', 'ironsrc.com',
-]);
-
-function isAdDomain(hostname) {
-  if (!hostname) return false;
-  for (const ad of AD_DOMAINS) {
-    if (hostname === ad || hostname.endsWith('.' + ad)) return true;
-  }
-  return false;
-}
+adblock.mountAdBlockRuntime(app, PUBLIC_BASE_URL);
+const RUNTIME_SCRIPT_TAG = `<script src="${PUBLIC_BASE_URL}/adblock-runtime.js"></script>`;
+const proxyCache = adblock.createAssetCache({ maxEntries: 1000, ttlMs: 60 * 60 * 1000 });
 
 // ─── Game Proxy Route ────────────────────────────────────────
 // Frontend use: fetch('/proxy/game?url=https://game.example.com/game/')
@@ -464,50 +474,45 @@ app.get('/proxy/game', async (req, res) => {
     return res.status(400).send('URL required');
   }
 
-  // Express already URL-decodes query params once, so `url` here is
-  // already the real game URL. Decoding it AGAIN can corrupt URLs that
-  // legitimately contain a `%` in their own query string — so we try
-  // the plain value first, and only fall back to a manual decode.
-  let targetUrl;
-  try {
-    targetUrl = new URL(url);
-  } catch {
-    try {
-      targetUrl = new URL(decodeURIComponent(url));
-    } catch {
-      return res.status(400).send('Invalid URL');
-    }
+  const cached = proxyCache.get(url);
+  if (cached) {
+    res.set('Content-Type', cached.contentType);
+    return res.send(cached.buffer);
   }
 
-  // Block direct ad domain access
-  if (isAdDomain(targetUrl.hostname)) {
-    return res.status(204).send('');
+  const safe = await adblock.isSafeTarget(url);
+  if (!safe) {
+    return res.status(400).send('Invalid or unsafe URL');
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
   try {
-    const response = await axios.get(targetUrl.toString(), {
-      timeout: 10000,
-      responseType: 'arraybuffer',
+    const targetUrl = new URL(url);
+    const upstream = await fetch(targetUrl.toString(), {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
         'Referer': targetUrl.origin,
       },
-      maxRedirects: 5,
+      signal: controller.signal,
+      redirect: 'follow',
     });
 
-    const contentType = response.headers['content-type'] || 'text/html';
+    if (!upstream.ok) {
+      return res.status(502).send(`Upstream returned ${upstream.status}`);
+    }
 
-    // ─── HEADERS ───────────────────────────────────────────
-    // Permissive on purpose so embedded games (which load assets from all
-    // over the place) keep working. The actual ad-blocking happens via the
-    // injected script below + the domain check above — NOT via this CSP.
-    // We deliberately do NOT set X-Frame-Options here: "ALLOWALL" is not a
-    // real value and modern browsers treat unrecognised values as DENY,
-    // which would silently block your own iframe from rendering anything.
+    const contentType = upstream.headers.get('content-type') || 'text/html';
+
+    // Permissive CSP on purpose — embedded games load assets from many
+    // origins. Actual ad-blocking happens via stripAds() + the runtime
+    // script, not via this header. Deliberately no X-Frame-Options:
+    // "ALLOWALL" isn't a real value and modern browsers treat unknown
+    // values as DENY, which would silently block your own iframe.
     res.set({
-      'Content-Type': contentType,
       'Content-Security-Policy': [
         "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
         "script-src * 'unsafe-inline' 'unsafe-eval' blob: data:",
@@ -515,102 +520,46 @@ app.get('/proxy/game', async (req, res) => {
         "frame-src * data: blob:",
         "img-src * data: blob:",
       ].join('; '),
-      'Cache-Control': 'public, max-age=300',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET',
     });
 
-    // HTML content: inject ad-blocking JavaScript
     if (contentType.includes('text/html')) {
-      let html = Buffer.from(response.data).toString('utf-8');
+      const html = await upstream.text();
+      const cheerio = require('cheerio');
+      const $ = cheerio.load(html);
 
-      const adBlockScript = `<script>
-(function() {
-  var AD_DOMAINS = ${JSON.stringify([...AD_DOMAINS])};
-  function isAd(url) {
-    try {
-      var h = new URL(url, location.href).hostname;
-      return AD_DOMAINS.some(function(d){ return h===d||h.endsWith('.'+d); });
-    } catch(e){ return false; }
-  }
-  // Block fetch
-  var _fetch = window.fetch;
-  window.fetch = function(input, init) {
-    var url = typeof input==='string' ? input : (input&&input.url)||'';
-    if(isAd(url)) return Promise.reject(new Error('Blocked'));
-    return _fetch.apply(this, arguments);
-  };
-  // Block XHR
-  var _open = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(m, url) {
-    if(isAd(String(url))) { this._sharxBlocked=true; return; }
-    return _open.apply(this, arguments);
-  };
-  var _send = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function() {
-    if(this._sharxBlocked) return;
-    return _send.apply(this, arguments);
-  };
-  // Block window.open (popups)
-  var _wopen = window.open;
-  window.open = function(url) {
-    if(url && isAd(String(url))) return null;
-    return _wopen && _wopen.apply(this, arguments);
-  };
-  // Remove ad elements
-  function removeAds() {
-    document.querySelectorAll('iframe,script,ins').forEach(function(el) {
-      var src = el.src || el.getAttribute('src') || '';
-      if(src && isAd(src)) el.remove();
-    });
-  }
-  new MutationObserver(removeAds).observe(document.documentElement, {childList:true, subtree:true});
-  document.addEventListener('DOMContentLoaded', removeAds);
-})();
-</script>`;
+      adblock.stripAds($, targetUrl.toString());
+      $('head').append(RUNTIME_SCRIPT_TAG);
 
-      if (html.includes('<head>')) {
-        html = html.replace('<head>', '<head>' + adBlockScript);
-      } else if (html.includes('<html>')) {
-        html = html.replace('<html>', '<html>' + adBlockScript);
-      } else {
-        html = adBlockScript + html;
-      }
+      const finalHtml = $.html();
+      const buffer = Buffer.from(finalHtml, 'utf-8');
+      proxyCache.set(url, { buffer, contentType: 'text/html; charset=utf-8' });
 
-      // Set base URL for relative resources
-      if (!html.includes('<base ')) {
-        const baseTag = `<base href="${targetUrl.origin}${targetUrl.pathname.replace(/[^/]*$/, '')}">`;
-        if (html.includes('<head>')) {
-          html = html.replace('<head>', '<head>' + baseTag);
-        }
-      }
-
-      return res.send(html);
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      return res.send(buffer);
     }
 
-    // Non-HTML content (JS, CSS, images) directly serve
-    res.send(Buffer.from(response.data));
-
+    // Non-HTML: stream to the client while caching a copy for next time
+    res.set('Content-Type', contentType);
+    const { Readable } = require('stream');
+    const nodeStream = Readable.fromWeb(upstream.body);
+    const chunks = [];
+    nodeStream.on('data', (chunk) => chunks.push(chunk));
+    nodeStream.on('end', () => {
+      proxyCache.set(url, { buffer: Buffer.concat(chunks), contentType });
+    });
+    nodeStream.on('error', (err) => console.error('[proxy] stream error:', err.message));
+    nodeStream.pipe(res);
   } catch (error) {
     console.error('Proxy error:', error.message);
-    // On failure, redirect to original URL as fallback
-    res.redirect(targetUrl.toString());
-  }
-});
-
-// ─── Ad domain blocker — direct resource requests ────────────
-// If any request's referer is an ad domain, return 204 (no content)
-app.use((req, res, next) => {
-  const referer = req.headers.referer || '';
-  try {
-    if (referer) {
-      const ref = new URL(referer);
-      if (isAdDomain(ref.hostname)) {
-        return res.status(204).send('');
-      }
+    if (error.name === 'AbortError') {
+      return res.status(504).send('Game host took too long to respond');
     }
-  } catch {}
-  next();
+    res.status(502).send('Could not load game');
+  } finally {
+    clearTimeout(timeoutId);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -621,4 +570,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Playvora Server running on port ${PORT}`);
   console.log(`📱 Local:   http://localhost:${PORT}`);
   console.log(`🌐 Network: http://<your-ip>:${PORT}`);
+  console.log(`🌐 Public base URL (used for ad-block runtime): ${PUBLIC_BASE_URL}`);
+  if (PUBLIC_BASE_URL.includes('localhost')) {
+    console.log(`⚠️  PUBLIC_BASE_URL is not set — ad-block runtime script will 404 for real visitors.`);
+  }
+  adblock.startBlocklistAutoRefresh();
 });

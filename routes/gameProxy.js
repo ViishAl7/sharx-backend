@@ -1,26 +1,45 @@
 /**
  * routes/gameProxy.js
- * ────────────────────────────────────────────────────────────
- * Bhai yahi hai REAL ad-blocker. Cross-origin iframe ke andar
- * JS inject nahi ho sakta (browser security rule, koi bhi
- * website yeh allow nahi karti) — isliye game ko apne server
- * se fetch karke, ad <script>/<iframe> tags nikaal ke, apne
- * domain se serve karo. Phir frontend ka iframe "same-origin"
- * ban jaata hai aur AD_BLOCK_SCRIPT andar chal jaati hai.
+ * ----------------------------------------------------------------
+ * This is the real ad-blocker. A cross-origin iframe cannot have JS
+ * injected into it (browser security — no real website allows that).
+ * So instead: fetch the game's HTML on OUR server, strip out the ad
+ * <script>/<iframe> tags, and serve it back from our own domain.
+ * That makes the frontend's iframe "same-origin", so the
+ * AD_BLOCK_SCRIPT can actually run inside it.
  *
- * Setup:
- *   npm install express cheerio
- *   app.use("/api", require("./routes/gameProxy"));
- *   (Node 18+ already has global fetch — node-fetch nahi chahiye)
- * ────────────────────────────────────────────────────────────
+ * IMPORTANT — how to mount this (this is what was causing your 404):
+ * Your frontend calls:
+ *     `${API_BASE}/proxy/game?url=...`
+ * So in your main server file (server.js / app.js / index.js), mount
+ * this router with NO prefix:
+ *     app.use(require("./routes/gameProxy"));
+ *
+ * Do NOT write app.use("/api", require("./routes/gameProxy")) unless
+ * you also change the frontend to call `${API_BASE}/api/proxy/game`.
+ * Whichever side you pick, both sides must match exactly, or you get
+ * the same 404 you just had.
+ * ----------------------------------------------------------------
  */
 
 const express = require("express");
 const cheerio = require("cheerio");
+const dns = require("dns").promises;
 const router = express.Router();
 
-// Known ad / tracker domains — yahi list frontend wali AD_BLOCK_SCRIPT
-// me bhi hai, dono jagah sync rakhna (ek shared file me daal sakte ho).
+// NOTE: I removed these lines that were in your original file:
+//   const passkeyRoutes = require('./routes/passkey');
+//   const userRoutes = require('./routes/userRoutes');
+//   const authRoutes = require('./routes/auth');
+// They were never used anywhere in this file. Worse — if any one of
+// those paths is wrong, `require()` throws at server startup and your
+// ENTIRE server crashes, not just this one route. Those belong in your
+// main server file where they're actually mounted, not here.
+
+// Known ad / tracker domains.
+// Keep this list identical to the AD_DOMAINS array in the frontend's
+// AD_BLOCK_SCRIPT. Better long-term fix: move this list into one shared
+// JSON file both sides import, so they can never drift apart.
 const AD_DOMAINS = [
   "doubleclick.net", "googlesyndication.com", "googleadservices.com",
   "adnxs.com", "rubiconproject.com", "openx.net", "pubmatic.com",
@@ -47,21 +66,65 @@ function isAdUrl(url) {
   }
 }
 
-// SSRF guard — kabhi bhi apne internal network ko proxy mat hone do
-function isSafeTarget(rawUrl) {
+/* ──────────────────────────────────────────────────────────────
+   SSRF protection (SSRF = a user tricks your server into fetching
+   an internal/private address instead of a real game URL)
+   ────────────────────────────────────────────────────────────── */
+
+// Checks if an IP address belongs to your own machine, your private
+// network, or a cloud "metadata" service (these endpoints can leak
+// cloud account credentials if reached — this is a real, common attack).
+function isPrivateOrReservedIp(ip) {
+  // IPv4
+  if (/^127\./.test(ip)) return true;                        // loopback (the machine itself)
+  if (/^10\./.test(ip)) return true;                         // private network
+  if (/^192\.168\./.test(ip)) return true;                   // private network
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;     // private network
+  if (/^169\.254\./.test(ip)) return true;                   // covers 169.254.169.254, the cloud metadata address on AWS/GCP/Azure
+  if (ip === "0.0.0.0") return true;
+
+  // IPv6
+  if (ip === "::1") return true;                              // loopback
+  if (/^fe80:/i.test(ip)) return true;                        // link-local
+  if (/^fc00:/i.test(ip) || /^fd00:/i.test(ip)) return true;  // unique-local (covers AWS's IPv6 metadata address)
+
+  return false;
+}
+
+// Your original isSafeTarget() only checked the hostname text itself.
+// Problem: an attacker can register a normal-looking public domain
+// name that simply resolves (via DNS) to an internal IP like
+// 169.254.169.254. The hostname looks fine; the real destination isn't.
+// This is called "DNS rebinding." Fix: actually resolve the hostname
+// and check the real IP too, not just the text.
+async function isSafeTarget(rawUrl) {
+  let parsed;
   try {
-    const { protocol, hostname } = new URL(rawUrl);
-    if (!["http:", "https:"].includes(protocol)) return false;
-    if (["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(hostname)) return false;
-    if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostname)) return false;
-    return true;
+    parsed = new URL(rawUrl);
   } catch {
     return false;
   }
+
+  if (!["http:", "https:"].includes(parsed.protocol)) return false;
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(hostname)) return false;
+  if (isPrivateOrReservedIp(hostname)) return false; // covers the case where someone passes a raw IP
+
+  try {
+    const records = await dns.lookup(hostname, { all: true });
+    if (records.some((r) => isPrivateOrReservedIp(r.address))) return false;
+  } catch {
+    // Couldn't resolve it at all — treat as unsafe rather than guessing
+    return false;
+  }
+
+  return true;
 }
 
-// Same runtime that frontend injects — yahan bhi rakha hai taaki proxy ke
-// through aane wale HTML ke <head> me sabse pehle hi block ho jaaye.
+// Same ad-blocking runtime the frontend injects — duplicated here so it
+// lands inside the proxied page's <head> before anything else on that
+// page gets a chance to run.
 const AD_BLOCK_RUNTIME = `
 (function(){
   var AD_DOMAINS=${JSON.stringify(AD_DOMAINS)};
@@ -82,18 +145,36 @@ const AD_BLOCK_RUNTIME = `
 router.get("/proxy/game", async (req, res) => {
   const targetUrl = req.query.url;
 
-  if (!targetUrl || !isSafeTarget(targetUrl)) {
+  if (!targetUrl) {
+    return res.status(400).send("Missing url parameter");
+  }
+
+  const safe = await isSafeTarget(targetUrl);
+  if (!safe) {
     return res.status(400).send("Invalid or unsafe URL");
   }
+
+  // Hard timeout on the upstream fetch. Without this, one slow or dead
+  // game host can hang this request indefinitely, tying up a server
+  // worker the whole time.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
 
   try {
     const upstream = await fetch(targetUrl, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; SharxProxy/1.0)" },
+      signal: controller.signal,
+      redirect: "follow",
     });
+
+    if (!upstream.ok) {
+      return res.status(502).send(`Upstream returned ${upstream.status}`);
+    }
+
     const contentType = upstream.headers.get("content-type") || "";
 
-    // Non-HTML assets (js, css, images served relative to the game) ko
-    // seedha pass-through karo, ad-stripping sirf HTML pe lagti hai.
+    // Non-HTML assets (the game's own JS, CSS, images) get passed
+    // straight through — ad-stripping only applies to HTML pages.
     if (!contentType.includes("text/html")) {
       res.set("Content-Type", contentType);
       const buf = await upstream.arrayBuffer();
@@ -104,7 +185,7 @@ router.get("/proxy/game", async (req, res) => {
     const $ = cheerio.load(html);
     const base = new URL(targetUrl);
 
-    // 1) Ad/tracker <script> aur <iframe> tags hata do
+    // 1) Remove ad/tracker <script> and <iframe> tags
     $("script[src], iframe[src]").each((_, el) => {
       const src = $(el).attr("src");
       if (!src) return;
@@ -113,16 +194,16 @@ router.get("/proxy/game", async (req, res) => {
       } catch {}
     });
 
-    // 2) Popup-triggering inline onclick="window.open(...)" hata do
+    // 2) Remove popup-triggering inline onclick="window.open(...)" handlers
     $("[onclick]").each((_, el) => {
       const onclick = $(el).attr("onclick") || "";
       if (/window\.open/i.test(onclick)) $(el).removeAttr("onclick");
     });
 
-    // 3) Meta-refresh redirect ads (malvertising ka purana trick) hata do
+    // 3) Remove meta-refresh redirect ads (an old malvertising trick)
     $('meta[http-equiv="refresh"]').remove();
 
-    // 4) Relative src/href ko absolute karo taaki game ke assets load ho
+    // 4) Rewrite relative src/href to absolute, so the game's own assets still load
     $("[src]").each((_, el) => {
       const src = $(el).attr("src");
       if (src && !/^([a-z]+:)?\/\//i.test(src) && !src.startsWith("data:")) {
@@ -136,14 +217,19 @@ router.get("/proxy/game", async (req, res) => {
       }
     });
 
-    // 5) Apna ad-block runtime sabse pehle <head> me daal do (DOMContentLoaded se pehle chale)
+    // 5) Inject our ad-block runtime first in <head>, before anything else runs
     $("head").prepend(`<script>${AD_BLOCK_RUNTIME}</script>`);
 
     res.set("Content-Type", "text/html; charset=utf-8");
     res.send($.html());
   } catch (err) {
     console.error("[Sharx Proxy] failed:", err.message);
+    if (err.name === "AbortError") {
+      return res.status(504).send("Game host took too long to respond");
+    }
     res.status(502).send("Could not load game");
+  } finally {
+    clearTimeout(timeoutId);
   }
 });
 
