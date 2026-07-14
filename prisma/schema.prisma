@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id          Int     @id @default(autoincrement())
+  name        String
+  email       String  @unique
+  password    String?
+  googleId    String? @unique
+  avatar      String?
+  score       Int     @default(0)
+  microsoftId String? @unique
+
+  // FIX: passkey data was previously stored in an in-memory JS object
+  // (`const users = {}` in routes/passkey.js), which meant every
+  // registered passkey was WIPED on every server restart/deploy/crash.
+  // Moving it into the User row itself makes it durable, and makes a
+  // passkey just another login method tied to the same account as
+  // Google/Microsoft — consistent with how googleId/microsoftId work.
+  passkeyCredentialId String? @unique
+  passkeyPublicKey    Bytes?
+  passkeyCounter      Int?
+
+  // FIX: the WebAuthn registration/login "challenge" used to live in a
+  // single shared `router._pendingChallenge` variable — one challenge
+  // for the entire server, for every user, at once. Two people
+  // registering or logging in with a passkey at the same moment would
+  // silently overwrite each other's challenge and fail verification.
+  // Storing it per-user (with an expiry) fixes that.
+  currentChallenge          String?
+  currentChallengeExpiresAt DateTime?
+
+  matches Match[]
+}
+
+model Match {
+  id        Int      @id @default(autoincrement())
+  result    String
+  score     Int
+  createdAt DateTime @default(now())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+}

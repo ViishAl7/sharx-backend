@@ -1,0 +1,39 @@
+{
+  "name": "gaming-backend",
+  "version": "1.0.1",
+  "description": "Playvora gaming backend — auth, games feed, ad-block proxy, realtime leaderboard",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "node backend.test.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^6.16.2",
+    "@simplewebauthn/server": "^13.3.0",
+    "bcrypt": "^6.0.0",
+    "cheerio": "^1.2.0",
+    "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.4.1",
+    "express-session": "^1.19.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "passport": "^0.7.0",
+    "passport-google-oauth20": "^2.0.0",
+    "passport-microsoft": "^2.1.0",
+    "resend": "^6.9.4",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "prisma": "^6.16.2"
+  }
+}

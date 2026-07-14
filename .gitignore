@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Broken/backup files that shouldn't exist in version control
+*.backup
+*.bak
+*.error
+*.orig
+
+# Local SQLite (this project uses Postgres — a stray dev.db is a
+# leftover, not a real data source)
+prisma/dev.db
+prisma/dev.db-journal
+
+# Archives that sometimes get dropped in a repo by mistake
+*.zip
