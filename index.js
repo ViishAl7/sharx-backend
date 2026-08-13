@@ -915,7 +915,37 @@ app.get('/games', withTimeout(15000, 'Games request'), async (req, res) => {
     }
   }
 });
+// ─────────────────────────────────────────────
+// GET SINGLE GAME BY ID
+// Example:
+// GET /games/gm_12345
+// ─────────────────────────────────────────────
+app.get("/games/:id", async (req, res) => {
+  try {
+    const games = await getGames();
 
+    console.log("Requested ID:", req.params.id);
+    console.log("Games length:", games.length);
+
+    const game = games.find((g) => g.id === req.params.id);
+
+    console.log("Found:", !!game);
+
+    if (!game) {
+      console.log("First 5 IDs:", games.slice(0, 5).map(g => g.id));
+      return res.status(404).json({
+        error: "Game not found",
+      });
+    }
+
+    res.json(game);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: "Failed to load game",
+    });
+  }
+});
 app.get('/categories', withTimeout(15000, 'Categories request'), async (req, res) => {
   try {
     const games = await getGames();
