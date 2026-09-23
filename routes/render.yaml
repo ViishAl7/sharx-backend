@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: sharx-backend
+    runtime: node
+    plan: starter  # $7/mo — 2 GB RAM, CHROMIUM CHALEGA
+    buildCommand: |
+      apt-get update && apt-get install -y \
+        chromium-browser \
+        chromium \
+        fonts-liberation \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libatk1.0-0 \
+        libcups2 \
+        libdrm2 \
+        libgbm1 \
+        libgtk-3-0 \
+        libnspr4 \
+        libnss3 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        xdg-utils \
+        --no-install-recommends
+      npm install
+      npx prisma generate
+    startCommand: node index.js
+    envVars:
+      - key: PUPPETEER_SKIP_CHROMIUM_DOWNLOAD
+        value: "true"
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium-browser
+      - key: PUPPETEER_ARGS
+        value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-gpu,--single-process"
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false

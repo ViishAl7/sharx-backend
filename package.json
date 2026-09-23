@@ -8,7 +8,8 @@
     "dev": "node index.js",
     "test": "node backend.test.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate deploy"
+    "prisma:migrate": "prisma migrate deploy",
+    "postinstall": "prisma generate"
   },
   "keywords": [],
   "author": "",
@@ -25,11 +26,14 @@
     "express": "^5.2.1",
     "express-rate-limit": "^7.4.1",
     "express-session": "^1.19.0",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.2",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.3",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "passport-microsoft": "^2.1.0",
+    "puppeteer": "^21.11.0",
     "resend": "^6.9.4",
     "socket.io": "^4.8.3"
   },

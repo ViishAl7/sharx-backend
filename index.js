@@ -50,10 +50,6 @@ const authRoutes = require('./routes/auth');
 require('./Controllers/authController'); // side-effects (passport config)
 
 // ─── Required env vars — fail fast with a clear message ────
-// FIX: previously a missing JWT_SECRET meant jwt.sign()/jwt.verify() would
-// throw at request time with a confusing low-level error ("secretOrPrivateKey
-// must have a value"), for every single request that touched auth, forever,
-// until someone noticed. Check it once at startup instead.
 const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length > 0) {
@@ -62,11 +58,6 @@ if (missingEnv.length > 0) {
   process.exit(1);
 }
 
-// FIX: SESSION_SECRET used to silently fall back to a hardcoded string
-// ('gaming_secret') if unset. That's fine for local dev but a real
-// security risk in production (anyone who reads this source knows the
-// session-signing secret). Now it's required outright in production and
-// only falls back to a dev-only value with a loud warning otherwise.
 if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
   console.error('❌ SESSION_SECRET must be set in production. Refusing to start with an insecure default.');
   process.exit(1);
@@ -79,7 +70,7 @@ if (!process.env.SESSION_SECRET) {
 // ─── Initialise ─────────────────────────────────────────────
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1); // needed for correct req.ip / rate-limiting behind a reverse proxy (Render, Railway, nginx, etc.)
+app.set('trust proxy', 1);
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const server = http.createServer(app);
@@ -87,16 +78,7 @@ const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
-// ─── Crash Guards ───────────────────────────────────
-// Without this, one bad request (e.g. a bug inside lib/adblock.js, or an
-// unexpected upstream response) can throw OUTSIDE any try/catch and kill
-// the entire Node process. Once that happens, EVERY route — even ones
-// completely unrelated to the request that crashed it — stops responding.
-// That is what "net::ERR_CONNECTION_REFUSED" on every asset means: nothing
-// is listening on the port anymore.
-// This does NOT fix the underlying bug — it only stops it from taking the
-// whole server down. Watch this log for a stack trace; that tells you the
-// real line to fix.
+// ─── Crash Guards ───────────────────────────────────────────
 process.on('uncaughtException', (err) => {
   console.error('❌ [uncaughtException] This would have crashed the server:', err);
 });
@@ -106,13 +88,8 @@ process.on('unhandledRejection', (reason) => {
 
 // ─── OTP Store ──────────────────────────────────────────────
 const otpStore = new Map();
-const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_EXPIRY_MS = 10 * 60 * 1000;
 
-// FIX: otpStore is an in-memory Map that only ever grew — expired entries
-// were left in place until the SAME email requested another OTP. A steady
-// trickle of different emails requesting password resets (or being
-// targeted by an attacker enumerating emails) meant unbounded memory
-// growth over the server's lifetime. Sweep expired entries periodically.
 const otpCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [email, entry] of otpStore.entries()) {
@@ -121,18 +98,10 @@ const otpCleanupTimer = setInterval(() => {
 }, 5 * 60 * 1000);
 otpCleanupTimer.unref?.();
 
-// ─── Last Proxied Game URL (for fallback asset resolution) ──
+// ─── Last Proxied Game URL ──────────────────────────────────
 let lastProxiedGameUrl = null;
 
 // ─── CORS ───────────────────────────────────────────────────
-// FIX: the original config reflected ANY incoming Origin header back with
-// credentials: true — this is functionally "allow every website on the
-// internet to make authenticated requests," which defeats the purpose of
-// CORS entirely for an app that issues auth tokens/cookies. Now it uses an
-// explicit allow-list. Set ALLOWED_ORIGINS in .env as a comma-separated
-// list (e.g. "https://playvora.com,https://www.playvora.com"). Falls back
-// to allowing localhost origins only, so local dev keeps working even if
-// the env var isn't set yet.
 const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((o) => o.trim())
@@ -146,11 +115,11 @@ function isAllowedOrigin(origin) {
 }
 
 if (configuredOrigins.length === 0) {
-  console.warn('⚠️  ALLOWED_ORIGINS is not set — only localhost origins will be allowed for CORS. Set ALLOWED_ORIGINS in .env before deploying (e.g. "https://yourdomain.com").');
+  console.warn('⚠️  ALLOWED_ORIGINS is not set — only localhost origins will be allowed for CORS. Set ALLOWED_ORIGINS in .env before deploying.');
 }
 
 const corsOptionsDelegate = (origin, callback) => {
-  if (!origin) return callback(null, true); // same-origin / server-to-server / curl requests have no Origin header
+  if (!origin) return callback(null, true);
   if (isAllowedOrigin(origin)) return callback(null, true);
   console.warn(`[CORS] Blocked request from disallowed origin: ${origin}`);
   return callback(null, false);
@@ -164,16 +133,10 @@ app.use(
 );
 
 // ─── Security headers ───────────────────────────────────────
-// FIX: no security headers at all previously. helmet's defaults cover the
-// common baseline (X-Content-Type-Options, X-Frame-Options, etc).
-// contentSecurityPolicy is disabled because this server proxies and
-// serves arbitrary third-party game HTML/JS/CSS/wasm through /proxy/* —
-// a strict default CSP would break those games; the ad-block + SSRF-guard
-// layers in lib/adblock.js are the actual defense for that surface.
 app.use(
   helmet({
     contentSecurityPolicy: false,
-    crossOriginResourcePolicy: false, // games/assets are intentionally served cross-origin
+    crossOriginResourcePolicy: false,
     crossOriginEmbedderPolicy: false,
   })
 );
@@ -182,10 +145,6 @@ app.use(
 app.use(cookieParser());
 app.use(compression({
   filter: (req, res) => {
-    // /proxy/* is mostly images, audio, wasm, video (already compressed)
-    // plus streamed binary responses — gzipping any of that again just
-    // burns CPU for no size win, and the extra pass adds latency games
-    // don't need. Everything else (API JSON, etc.) still compresses.
     if (req.path.startsWith('/proxy/')) return false;
     return compression.filter(req, res);
   },
@@ -208,12 +167,9 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-// ─── Rate limiting on auth-sensitive endpoints ──────────────
-// FIX: /login, /signup, /forgot-password, /verify-otp, /reset-password had
-// zero rate limiting — an attacker could brute-force passwords/OTPs or
-// spam-trigger OTP emails at unlimited speed. These limits are per-IP.
+// ─── Rate limiting ──────────────────────────────────────────
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
@@ -222,7 +178,7 @@ const authLimiter = rateLimit({
 
 const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5, // OTP requests/verifications are more sensitive — tighter limit
+  max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many attempts. Please try again later.' },
@@ -241,9 +197,6 @@ io.on('connection', (socket) => {
   console.log('User connected 🔥');
 
   socket.on('joinRoom', (roomId) => {
-    // FIX: roomId was joined with no validation — a non-string or absurd
-    // value could be used to probe internal behavior. Cheap guard, no
-    // behavior change for legitimate callers.
     if (typeof roomId !== 'string' || roomId.length === 0 || roomId.length > 100) return;
     socket.join(roomId);
   });
@@ -259,11 +212,6 @@ io.on('connection', (socket) => {
 });
 
 // ─── Email Template ─────────────────────────────────────────
-// FIX: escape the user's own name before interpolating it into HTML —
-// previously a user whose display name contained HTML (e.g. from a
-// Google/Microsoft profile name, or a signup form with no server-side
-// sanitization elsewhere) could inject markup into their own password
-// reset email. Low severity (it's their own inbox) but free to fix.
 function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -331,10 +279,6 @@ function authMiddleware(req, res, next) {
 }
 
 // ─── Validation helpers ─────────────────────────────────────
-// FIX: signup/forgot-password previously only checked `email.includes('@')`
-// (or nothing at all for signup) — accepting garbage like "a@" or "@@@".
-// A real regex catches the obviously-invalid cases without being an
-// overengineered RFC 5322 validator (which nothing needs).
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function isValidEmail(email) {
   return typeof email === 'string' && EMAIL_RE.test(email);
@@ -351,27 +295,16 @@ function getRank(score) {
 
 // ════════════════════════════════════════════════════════════════
 //  🚀 UNIFIED ASSET PROXY HANDLER
-//  Handles all asset proxying logic — used by both /proxy/game and
-//  /proxy/asset routes. Eliminates code duplication.
 // ════════════════════════════════════════════════════════════════
 
 const assetProxyCache = adblock.createAssetCache({ maxEntries: 2000, ttlMs: 60 * 60 * 1000 });
 
-/**
- * Core asset proxy handler — shared by all routes.
- * @param {string} url - The target URL to proxy
- * @param {number} timeoutMs - Request timeout in milliseconds
- * @param {boolean} isHtmlGame - If true, applies ad-blocking and runtime script
- * @returns {Promise<{buffer, contentType, cacheControl}>}
- */
 async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
-  // Check cache first
   const cached = assetProxyCache.get(url);
   if (cached) {
     return cached;
   }
 
-  // Validate URL is safe
   const safe = await adblock.isSafeTarget(url);
   if (!safe) {
     const error = new Error('Invalid or unsafe URL');
@@ -404,11 +337,6 @@ async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
       throw error;
     }
 
-    // Upstream has started responding — the "did they even answer" risk is
-    // over. Clear the abort timer here so a large-but-progressing wasm/data
-    // download (which can take well over timeoutMs to fully arrive) isn't
-    // killed mid-transfer. Only a genuinely non-responding upstream will
-    // still hit the timeout, right here, before this point.
     clearTimeout(timeoutId);
 
     const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
@@ -418,68 +346,32 @@ async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
     let finalContentType = contentType;
 
     if (contentType.includes('text/html') && isHtmlGame) {
-      // Process HTML for ad-blocking and asset rewriting
       const html = await upstream.text();
       const $ = cheerio.load(html);
 
-      // Strip ads
       adblock.stripAds($, targetUrl.toString(), PUBLIC_BASE_URL);
-
-      // Rewrite all asset URLs to go through /proxy/asset
       rewriteAssetUrls($, targetUrl.toString());
 
-      // Disable the game's own service-worker registration.
-      // Some HTML5 games (Unity WebGL in particular) try to register their
-      // own service worker for offline caching, using a path relative to
-      // their own folder (e.g. "ServiceWorker.js"). Once proxied, that
-      // relative path resolves against THIS server instead of the real
-      // game host, points at a script that doesn't exist here, and throws
-      // an uncaught error in the browser. Properly proxying a real service
-      // worker (rewriting its internal fetch/cache logic too) is a much
-      // bigger job than it's worth here, so we just disable registration.
       const swGuardTag = `<script>try{if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject(new Error('Service worker disabled by proxy'));};}}catch(e){}</script>`;
       $('head').prepend(swGuardTag);
 
-      // Inject ad-block runtime script
       const runtimeScriptTag = `<script src="${PUBLIC_BASE_URL}/adblock-runtime.js"></script>`;
       $('head').append(runtimeScriptTag);
 
       const finalHtml = $.html();
       buffer = Buffer.from(finalHtml, 'utf-8');
       finalContentType = 'text/html; charset=utf-8';
-      // This HTML has proxy links baked in using the CURRENT PUBLIC_BASE_URL.
-      // Never let the browser cache it long-term — if that value ever
-      // changes (or was wrong on an earlier run), a cached copy would keep
-      // replaying broken links indefinitely instead of picking up the fix.
       cacheControl = 'no-cache';
     } else if (contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
-      // For JS files
       buffer = Buffer.from(await upstream.arrayBuffer());
       finalContentType = 'application/javascript; charset=utf-8';
     } else if (contentType.includes('text/css')) {
-      // For CSS files — rewrite url(...) references before serving.
-      // cheerio only rewrites tags in the HTML document; it cannot see
-      // inside a separately-fetched .css file. Without this, any image
-      // referenced from CSS (Unity's progress-bar/logo images are exactly
-      // this case) bypasses the proxy and breaks.
       const cssText = await upstream.text();
       const rewrittenCss = rewriteCssUrls(cssText, targetUrl.toString());
       buffer = Buffer.from(rewrittenCss, 'utf-8');
       finalContentType = 'text/css; charset=utf-8';
-      // Same reasoning as the HTML branch above — this CSS also has
-      // PUBLIC_BASE_URL-based proxy links baked into it.
       cacheControl = 'no-cache';
     } else {
-      // Binary assets (images, audio, video, wasm, etc.) — these need no
-      // text transformation, so stream them straight through instead of
-      // buffering first. Buffering means: wait for the FULL download,
-      // THEN send the FULL thing to the browser — for a 30-50MB Unity
-      // .wasm/.data file that's roughly double the wait for no reason.
-      // Streaming lets bytes reach the browser as they arrive from
-      // upstream. Not cached in assetProxyCache (nothing to cache once
-      // it's been piped through rather than collected into a buffer) —
-      // an acceptable trade-off since large files are the ones this
-      // change targets, and browsers still cache them via Cache-Control.
       return {
         stream: Readable.fromWeb(upstream.body),
         contentType: finalContentType,
@@ -507,11 +399,6 @@ async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
   }
 }
 
-/**
- * Send a handleAssetProxy() result — whether it's a full buffer (html/css/js,
- * or a cache hit) or a stream (binary passthrough). Headers must already be
- * set on `res` before calling this.
- */
 function sendProxyResult(result, res) {
   if (result.stream) {
     result.stream.on('error', (err) => {
@@ -527,38 +414,25 @@ function sendProxyResult(result, res) {
   return res.send(result.buffer);
 }
 
-/**
- * Rewrite all asset URLs in an HTML document to use /proxy/asset
- * Handles: script[src], img[src], iframe[src], audio[src], video[src],
- * source[src], link[href], object[data], and meta[content] for redirects.
- */
 function rewriteAssetUrls($, baseUrl) {
   const base = new URL(baseUrl);
   const proxyAssetUrl = `${PUBLIC_BASE_URL}/proxy/asset`;
 
-  // Helper to convert any URL to absolute
   function resolveUrl(urlStr) {
     if (!urlStr) return null;
     try {
-      // Protocol-relative URL, absolute URL, or root-relative — all resolve
-      // correctly against `base` via the URL constructor.
       return new URL(urlStr, base).href;
     } catch {
       return null;
     }
   }
 
-  // Helper to create proxy URL with cache-busting preserved
   function createProxyUrl(absoluteUrl) {
     if (!absoluteUrl) return null;
-    // Already one of our own proxy links (e.g. stripAds rewrote it first) —
-    // wrapping it again would produce ?url=<another proxy URL>, which then
-    // fails isSafeTarget for pointing back at our own localhost.
     if (absoluteUrl.startsWith(proxyAssetUrl)) return absoluteUrl;
     return `${proxyAssetUrl}?url=${encodeURIComponent(absoluteUrl)}`;
   }
 
-  // Rewrite script[src]
   $('script[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -568,7 +442,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite img[src]
   $('img[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -578,7 +451,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite iframe[src]
   $('iframe[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -588,7 +460,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite audio[src]
   $('audio[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -598,7 +469,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite video[src]
   $('video[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -608,7 +478,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite source[src] (inside audio/video)
   $('source[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -618,7 +487,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite link[href] (stylesheets, icons, etc.)
   $('link[href]').each((_, el) => {
     const href = $(el).attr('href');
     const absolute = resolveUrl(href);
@@ -628,7 +496,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite object[data]
   $('object[data]').each((_, el) => {
     const data = $(el).attr('data');
     const absolute = resolveUrl(data);
@@ -638,7 +505,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite embed[src]
   $('embed[src]').each((_, el) => {
     const src = $(el).attr('src');
     const absolute = resolveUrl(src);
@@ -648,7 +514,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite meta[content] for refresh redirects
   $('meta[http-equiv="refresh"]').each((_, el) => {
     const content = $(el).attr('content');
     if (content && content.includes('url=')) {
@@ -668,10 +533,6 @@ function rewriteAssetUrls($, baseUrl) {
     }
   });
 
-  // Rewrite url(...) references inside inline <style> blocks.
-  // Same reasoning as the external-CSS patch in handleAssetProxy — a
-  // background-image or font url() set in an inline <style> tag is
-  // invisible to the tag-based rewriting above.
   $('style').each((_, el) => {
     const cssText = $(el).html();
     if (cssText) {
@@ -680,19 +541,13 @@ function rewriteAssetUrls($, baseUrl) {
   });
 }
 
-/**
- * Rewrite url(...) references inside CSS text so they also route through
- * /proxy/asset. This covers both relative paths ("progress-bar.png") and
- * already-absolute ones — either way, the browser will otherwise hit the
- * image directly instead of going through the proxy/ad-blocker.
- */
 function rewriteCssUrls(cssText, baseUrl) {
   const base = new URL(baseUrl);
   const proxyAssetUrl = `${PUBLIC_BASE_URL}/proxy/asset`;
 
   return cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, path) => {
-    if (path.startsWith('data:')) return match; // inline data, nothing to proxy
-    if (path.startsWith(proxyAssetUrl)) return match; // already one of our own proxy links
+    if (path.startsWith('data:')) return match;
+    if (path.startsWith(proxyAssetUrl)) return match;
     try {
       const absolute = new URL(path, base).href;
       if (absolute.startsWith(proxyAssetUrl)) return `url(${quote}${absolute}${quote})`;
@@ -705,24 +560,19 @@ function rewriteCssUrls(cssText, baseUrl) {
 }
 
 // ─── Routes ──────────────────────────────────────────────────
-
-// Health check
 app.get('/', (req, res) => res.send('🎮 Playvora Gaming Server running 🚀'));
 
-// User routes
 app.use('/user', userRoutes);
 app.use('/auth', authRoutes);
 app.use('/passkey', passkeyRoutes);
 
 // ════════════════════════════════════════════════════════════════
 //  🎮 GAMES — multi-page parallel fetch, cached, filterable
-//  Fetches up to 6 GameMonetize pages in PARALLEL, dedupes by title,
-//  caches the full list once, then paginates + filters in memory.
 // ════════════════════════════════════════════════════════════════
 
 let gamesDataCache = {};
 let gamesFetchInFlight = null;
-const GAMES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const GAMES_CACHE_TTL = 10 * 60 * 1000;
 
 async function fetchGameMonetizePage(p, attempt = 1) {
   const MAX_ATTEMPTS = 3;
@@ -736,11 +586,6 @@ async function fetchGameMonetizePage(p, attempt = 1) {
     });
     const text = await res.text();
     if (text.trim().startsWith('<')) {
-      // GameMonetize's feed.php returned an HTML page instead of JSON —
-      // in practice this means their feed API itself is erroring right
-      // now (a 500 error page is HTML), not that this page has zero
-      // games. Retry a couple times (a plain 500 is often transient)
-      // before giving up, and log clearly either way.
       if (attempt < MAX_ATTEMPTS) {
         await new Promise((r) => setTimeout(r, 1500 * attempt));
         return fetchGameMonetizePage(p, attempt + 1);
@@ -751,11 +596,6 @@ async function fetchGameMonetizePage(p, attempt = 1) {
       return { page: p, games: [], stop: true };
     }
 
-    // FIX: JSON.parse() on a malformed-but-not-HTML response (truncated
-    // body, unexpected upstream change) used to throw and be caught by
-    // the outer catch, but only AFTER already consuming a retry attempt
-    // silently as a generic error with no useful log context. Now it's
-    // handled explicitly with a clear message.
     let json;
     try {
       json = JSON.parse(text);
@@ -771,19 +611,19 @@ async function fetchGameMonetizePage(p, attempt = 1) {
     if (!Array.isArray(json) || json.length === 0) return { page: p, games: [], stop: true };
 
     const games = json
-      // FIX: entries missing a title or url are filtered out here (not
-      // just later in fetchAllGames' de-dupe step) so `id` below never
-      // becomes the literal string "gm_undefined" for multiple different
-      // broken entries, which would collide with each other under the
-      // same fake id.
       .filter(g => g && g.title && g.url)
-      .map(g => ({
+      .map((g, idx) => ({
         id: `gm_${g.id || g.title}`,
         title: g.title,
         thumb: g.thumb,
+        video: g.video || null,
         url: g.url,
         category: g.category || 'Other',
-        source: 'gamemonetize'
+        description: g.description || '',
+        instructions: g.instructions || '',
+        tags: g.tags || '',
+        source: 'gamemonetize',
+        feedRank: (p - 1) * 500 + idx,
       }));
 
     console.log(`GameMonetize page ${p}: ${games.length} games`);
@@ -802,17 +642,36 @@ async function fetchGameMonetize() {
   const totalPages = 6;
   const pageNums = Array.from({ length: totalPages }, (_, i) => i + 1);
 
-  const results = await Promise.all(pageNums.map(fetchGameMonetizePage));
+  const results = [];
+  for (const page of pageNums) {
+    const result = await fetchGameMonetizePage(page);
+    results.push(result);
+    if (page < totalPages) {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 
-  // Preserve "stop at first short/empty/error page" behavior: keep games
-  // only from pages before (and including) the first one that signaled
-  // stop, in page order — even though they resolved out of order.
   results.sort((a, b) => a.page - b.page);
 
   const allGames = [];
+  let feedEnded = false;
+
   for (const r of results) {
+    if (r.errored) {
+      console.warn(`GameMonetize page ${r.page}: skipped after repeated errors, continuing to next page`);
+      continue;
+    }
+
     allGames.push(...r.games);
-    if (r.stop) break;
+
+    if (r.stop && !r.errored) {
+      feedEnded = true;
+      break;
+    }
+  }
+
+  if (!feedEnded) {
+    console.log('GameMonetize: reached end of configured page range without a natural feed end');
   }
 
   return allGames;
@@ -844,11 +703,6 @@ async function getGames() {
   if (!gamesFetchInFlight) {
     gamesFetchInFlight = fetchAllGames()
       .then(games => {
-        // Only cache real, non-empty results. An empty list almost always
-        // means GameMonetize's own feed API was erroring during this
-        // fetch — caching that for 10 minutes would keep serving "0
-        // games" long after they recover. Leaving it uncached means the
-        // next request just tries again fresh.
         if (games.length > 0) {
           gamesDataCache.allGames = { data: games, time: Date.now() };
         }
@@ -863,8 +717,6 @@ async function getGames() {
   return gamesFetchInFlight;
 }
 
-// If getGames() (or any upstream call) hangs, callers get a clean 504
-// instead of an open connection that never resolves.
 function withTimeout(ms, label) {
   return (req, res, next) => {
     const timer = setTimeout(() => {
@@ -878,16 +730,9 @@ function withTimeout(ms, label) {
   };
 }
 
-// Games list rarely changes within the cache window, safe to let
-// browsers/CDNs cache it briefly client-side too.
 const GAMES_CLIENT_CACHE_SECONDS = 60;
 
 app.get('/games', withTimeout(15000, 'Games request'), async (req, res) => {
-  // FIX: parseInt(req.query.page) with no bounds allowed page=0, negative
-  // pages (producing a negative `start` index — .slice(-50, 0) silently
-  // returns an empty array, not an error, which looked like "no games"
-  // for a bogus but easy-to-send query), or absurdly large pages that
-  // just always return []. Clamp to a sane minimum of 1.
   let page = parseInt(req.query.page, 10);
   if (!Number.isFinite(page) || page < 1) page = 1;
 
@@ -915,11 +760,28 @@ app.get('/games', withTimeout(15000, 'Games request'), async (req, res) => {
     }
   }
 });
-// ─────────────────────────────────────────────
-// GET SINGLE GAME BY ID
-// Example:
-// GET /games/gm_12345
-// ─────────────────────────────────────────────
+
+app.get('/games/trending', withTimeout(15000, 'Trending request'), async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
+
+  try {
+    const games = await getGames();
+    const trending = [...games]
+      .sort((a, b) => (a.feedRank ?? 0) - (b.feedRank ?? 0))
+      .slice(0, limit);
+
+    if (!res.headersSent) {
+      res.set('Cache-Control', `public, max-age=${GAMES_CLIENT_CACHE_SECONDS}`);
+      res.json(trending);
+    }
+  } catch (e) {
+    console.error('Trending error:', e.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to load trending games' });
+    }
+  }
+});
+
 app.get("/games/:id", async (req, res) => {
   try {
     const games = await getGames();
@@ -946,6 +808,7 @@ app.get("/games/:id", async (req, res) => {
     });
   }
 });
+
 app.get('/categories', withTimeout(15000, 'Categories request'), async (req, res) => {
   try {
     const games = await getGames();
@@ -963,7 +826,7 @@ app.get('/categories', withTimeout(15000, 'Categories request'), async (req, res
 });
 
 app.get('/stats', (req, res) => {
-  res.set('Cache-Control', 'no-store'); // stats should always be live
+  res.set('Cache-Control', 'no-store');
   res.json({
     totalGames: gamesDataCache.allGames?.data?.length || 0,
     cacheAge: gamesDataCache.allGames ? Math.round((Date.now() - gamesDataCache.allGames.time) / 1000) + 's' : 'no cache',
@@ -996,10 +859,6 @@ app.post('/signup', authLimiter, async (req, res) => {
     const { password: _, ...safeUser } = user;
     res.json({ message: 'User created successfully', user: safeUser });
   } catch (error) {
-    // FIX: a race condition (two signups with the same email landing at
-    // almost the same time) could slip past the findUnique check above
-    // and hit Prisma's own unique-constraint error (P2002) instead of the
-    // friendly "User already exists" message. Handle it explicitly.
     if (error.code === 'P2002') {
       return res.status(400).json({ message: 'User already exists' });
     }
@@ -1017,10 +876,6 @@ app.post('/login', authLimiter, async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
-    // FIX: previously "User not found" vs "Wrong password" were distinct
-    // messages — this lets an attacker enumerate which emails have
-    // accounts at all by trying logins and reading the error message.
-    // Both cases now return the same generic message.
     if (!user || !user.password) {
       return res.status(400).json({ message: 'Invalid email or password' });
     }
@@ -1047,8 +902,6 @@ app.post('/forgot-password', otpLimiter, async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({ where: { email } });
-    // Same response whether or not the account exists, so this endpoint
-    // can't be used to enumerate registered emails.
     if (!user) return res.json({ message: 'If that account exists, an OTP has been sent' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
@@ -1117,9 +970,6 @@ app.post('/reset-password', otpLimiter, async (req, res) => {
 
     res.json({ message: 'Password reset successful' });
   } catch (error) {
-    // FIX: if the user row was deleted between OTP verification and this
-    // call, prisma.user.update() throws P2025 — that used to fall
-    // through to a generic 500 "Reset error" instead of a clear message.
     if (error.code === 'P2025') {
       return res.status(400).json({ message: 'Account no longer exists' });
     }
@@ -1145,11 +995,6 @@ app.get('/profile', authMiddleware, async (req, res) => {
 app.post('/play', authMiddleware, async (req, res) => {
   try {
     const { result, score } = req.body;
-    // FIX: `typeof score !== 'number'` doesn't catch NaN or Infinity
-    // (both pass typeof === 'number'), and there was no upper bound at
-    // all — a client could submit score: 999999999999 and have it
-    // permanently added to their total. Added a sane cap; adjust
-    // MAX_SCORE_PER_MATCH to whatever your actual game's scoring allows.
     const MAX_SCORE_PER_MATCH = 100000;
     if (
       typeof score !== 'number' ||
@@ -1192,7 +1037,7 @@ app.get('/leaderboard', async (req, res) => {
     const players = await prisma.user.findMany({
       orderBy: { score: 'desc' },
       take: 10,
-      select: { name: true, score: true }, // FIX: was fetching full user rows (incl. password hash) into memory unnecessarily before mapping
+      select: { name: true, score: true },
     });
 
     const ranked = players.map((p, i) => ({
@@ -1219,70 +1064,120 @@ const contactLimiter = rateLimit({
   message: { success: false, message: 'Too many messages sent. Please try again later.' },
 });
 
+const CONTACT_REASONS = new Set([
+  'General question',
+  'Account or login issue',
+  'Report a broken game',
+  'Report inappropriate content',
+  'Bug or technical problem',
+  'Feedback or suggestion',
+  'Business inquiry',
+  'Game submission',
+  'Other',
+]);
+
 app.post('/contact', contactLimiter, async (req, res) => {
   try {
-    const { name, email, message, topic } = req.body;
-    if (!name || !email || !message) {
-      return res.status(400).json({ message: 'All fields required' });
+    const { name, email, message, topic, game, website } = req.body || {};
+
+    // Honeypot: real users never fill this hidden field.
+    if (typeof website === 'string' && website.trim()) {
+      return res.json({ success: true, message: 'Message sent successfully' });
+    }
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Name is required' });
+    }
+    if (name.trim().length > 80) {
+      return res.status(400).json({ success: false, message: 'Name is too long' });
     }
     if (!isValidEmail(email)) {
-      return res.status(400).json({ message: 'A valid email is required' });
+      return res.status(400).json({ success: false, message: 'A valid email is required' });
     }
-    if (String(message).length > 5000) {
-      return res.status(400).json({ message: 'Message is too long' });
+    if (email.length > 120) {
+      return res.status(400).json({ success: false, message: 'Email is too long' });
+    }
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ success: false, message: 'Message is required' });
+    }
+    if (message.trim().length < 4) {
+      return res.status(400).json({ success: false, message: 'Message is too short' });
+    }
+    if (message.length > 2000) {
+      return res.status(400).json({ success: false, message: 'Message is too long' });
+    }
+    if (typeof topic !== 'string' || !CONTACT_REASONS.has(topic)) {
+      return res.status(400).json({ success: false, message: 'Invalid contact topic' });
+    }
+    if (typeof game !== 'undefined' && game !== null && String(game).length > 200) {
+      return res.status(400).json({ success: false, message: 'Game information is too long' });
     }
 
-    // FIX: name/email/topic/message were interpolated directly into the
-    // outgoing HTML email with no escaping — a submitter could inject
-    // arbitrary HTML/markup (or attempt phishing-style content) into the
-    // email your team reads in their inbox. Escape everything from the
-    // request body before it goes into HTML.
-    const safeName = escapeHtml(name);
-    const safeEmail = escapeHtml(email);
-    const safeTopic = escapeHtml(topic || 'General');
-    const safeMessage = escapeHtml(message).replace(/\n/g, '<br>');
+    if (!process.env.RESEND_API_KEY) {
+      console.error('[contact] RESEND_API_KEY is not configured');
+      return res.status(503).json({ success: false, message: 'Contact service is temporarily unavailable' });
+    }
 
-    await resend.emails.send({
-      from: 'Playvora <onboarding@resend.dev>',
-      to: process.env.CONTACT_INBOX_EMAIL || 'vishalxr92@gmail.com',
-      subject: `New ${safeTopic} Message | Playvora`,
+    const safeName = escapeHtml(name.trim());
+    const safeEmail = escapeHtml(email.trim());
+    const safeTopic = escapeHtml(topic);
+    const safeGame = escapeHtml(String(game || '').trim());
+    const safeMessage = escapeHtml(message.trim()).replace(/\n/g, '<br>');
+    const inbox = process.env.CONTACT_INBOX_EMAIL || 'vishalxr92@gmail.com';
+    const from = process.env.CONTACT_FROM_EMAIL || 'SHARX <onboarding@resend.dev>';
+
+    const result = await resend.emails.send({
+      from,
+      to: inbox,
+      replyTo: email.trim(),
+      subject: `SHARX Contact — ${topic}`,
+      text: [
+        `Name: ${name.trim()}`,
+        `Email: ${email.trim()}`,
+        `Topic: ${topic}`,
+        game ? `Game: ${String(game).trim()}` : '',
+        '',
+        message.trim(),
+      ].filter(Boolean).join('\n'),
       html: `
-        <div style="font-family:sans-serif;padding:20px">
-          <h2>New Contact Message</h2>
-          <p><b>Name:</b> ${safeName}</p>
-          <p><b>Email:</b> ${safeEmail}</p>
-          <p><b>Topic:</b> ${safeTopic}</p>
-          <p><b>Message:</b></p>
-          <div style="background:#f5f5f5;padding:15px;border-radius:10px;">
-            ${safeMessage}
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#1B2A41;background:#FFFDF7;">
+          <div style="border:1px solid #1B2A41;border-radius:18px;padding:24px;background:#ffffff;">
+            <h2 style="margin:0 0 20px;font-size:24px;">New SHARX Contact Message</h2>
+            <p><strong>Name:</strong> ${safeName}</p>
+            <p><strong>Email:</strong> ${safeEmail}</p>
+            <p><strong>Topic:</strong> ${safeTopic}</p>
+            ${safeGame ? `<p><strong>Game:</strong> ${safeGame}</p>` : ''}
+            <div style="margin-top:20px;padding:16px;border-radius:12px;background:#FFF7E8;border:1px solid #1B2A41;">
+              <strong>Message</strong>
+              <div style="margin-top:10px;line-height:1.65;">${safeMessage}</div>
+            </div>
+            <p style="margin:20px 0 0;color:#6b7280;font-size:12px;">Reply to this email to respond directly to the sender.</p>
           </div>
         </div>
       `,
     });
 
-    res.json({ success: true, message: 'Message sent successfully' });
+    if (result?.error) {
+      console.error('[contact] Resend error:', result.error);
+      return res.status(502).json({ success: false, message: 'Failed to send message' });
+    }
+
+    return res.json({ success: true, message: 'Message sent successfully' });
   } catch (error) {
-    console.error('Contact error:', error);
-    res.status(500).json({ success: false, message: 'Failed to send message' });
+    console.error('[contact] Send error:', error?.message || error);
+    return res.status(500).json({ success: false, message: 'Failed to send message' });
   }
 });
 
 // ════════════════════════════════════════════════════════════════
-//  🚫 AD BLOCKER PROXY — ROUTES & MIDDLEWARE
+//  🚫 AD BLOCKER PROXY
 // ════════════════════════════════════════════════════════════════
 
-// Mount ad-block runtime script
 adblock.mountAdBlockRuntime(app, PUBLIC_BASE_URL);
 
-// ─── GAME PROXY ROUTE (Main Entry Point) ────────────────────
 app.get('/proxy/game', async (req, res) => {
   const { url } = req.query;
 
-  // If the frontend ever sends a game object whose `url` field is missing,
-  // `${gameUrl}` in a template literal silently becomes the *string*
-  // "undefined" — not a real error, just a broken value that used to sail
-  // straight through and surface later as a confusing 502 deep in an
-  // asset request. Catch it right here instead.
   if (!url || url === 'undefined' || url === 'null') {
     return res.status(400).json({ error: 'URL required' });
   }
@@ -1309,7 +1204,6 @@ app.get('/proxy/game', async (req, res) => {
   }
 });
 
-// ─── ASSET PROXY ROUTE (All Assets) ────────────────────────
 app.get('/proxy/asset', async (req, res) => {
   let { url } = req.query;
 
@@ -1317,27 +1211,14 @@ app.get('/proxy/asset', async (req, res) => {
     return res.status(400).json({ error: 'URL required' });
   }
 
-  // Backstop: unwrap a double-proxied link (?url=<our own /proxy/asset
-  // link>) instead of failing on it. The idempotency guards in
-  // rewriteAssetUrls/rewriteCssUrls should prevent new ones from being
-  // created, but this covers any other source of a pre-wrapped link.
   const selfProxyPrefix = `${PUBLIC_BASE_URL}/proxy/asset?url=`;
   if (url.startsWith(selfProxyPrefix)) {
     try {
       url = decodeURIComponent(url.slice(selfProxyPrefix.length));
-    } catch {
-      // malformed encoding — fall through and let isSafeTarget reject it
-    }
+    } catch {}
   }
 
   try {
-    // 45s — Unity's .wasm/.data files regularly run 10-50+MB. The 504s
-    // that used to show up in the console were OUR timeout firing, not
-    // the upstream actually failing — cutting the fetch off before a big
-    // file finished downloading, then handing Unity a JSON error body
-    // instead of the real binary (that's also what caused the "expected
-    // magic word" wasm compile error — Unity tried to parse our
-    // {"error":...} JSON as wasm).
     const result = await handleAssetProxy(url, 45000, false);
 
     res.set({
@@ -1359,25 +1240,6 @@ app.get('/proxy/asset', async (req, res) => {
   }
 });
 
-// ─── FALLBACK PROXY ROUTE ──────────────────────────────────
-// Unity (and most HTML5 game engines) build several asset URLs at RUNTIME
-// rather than putting them in the static HTML: CSS "url()" rules that
-// point outside this CSS file's own folder, and inline JS that creates
-// <script> tags using a path like "Build/xxx.loader.js". Neither passes
-// through rewriteAssetUrls() or rewriteCssUrls(), so they hit THIS server
-// directly as a bare relative path — e.g. /proxy/Build/xxx.loader.js —
-// which had no matching route at all. This catches anything under /proxy/
-// that isn't /proxy/game or /proxy/asset, and resolves it against the
-// real game's URL.
-//
-// To find the right game URL, we first check the Referer header (the
-// page/file that made this request) — this is per-request and correct
-// even with multiple people using the server at once. If that's missing,
-// we fall back to lastProxiedGameUrl — but that variable is a single
-// GLOBAL value shared by everyone, so the fallback only gives the right
-// answer when exactly one game is being loaded at a time. Fine for local
-// testing; not safe once you have concurrent users — the Referer check
-// above is what actually protects concurrent sessions.
 app.get(/^\/proxy\/(.+)/, async (req, res) => {
   try {
     let gameBaseUrl = lastProxiedGameUrl;
@@ -1388,9 +1250,7 @@ app.get(/^\/proxy\/(.+)/, async (req, res) => {
         const refUrl = new URL(referer);
         const refGameUrl = refUrl.searchParams.get('url');
         if (refGameUrl) gameBaseUrl = refGameUrl;
-      } catch {
-        // malformed referer header — keep the fallback value
-      }
+      } catch {}
     }
 
     if (!gameBaseUrl || gameBaseUrl === 'undefined' || gameBaseUrl === 'null') {
@@ -1401,8 +1261,6 @@ app.get(/^\/proxy\/(.+)/, async (req, res) => {
     const base = new URL(gameBaseUrl);
     const resolved = new URL(relativePath, base);
 
-    // Preserve any query string the browser sent on the relative request
-    // (e.g. cache-busting params like ?v=123)
     const originalQuery = req.url.split('?')[1];
     if (originalQuery) resolved.search = originalQuery;
 
@@ -1423,7 +1281,6 @@ app.get(/^\/proxy\/(.+)/, async (req, res) => {
   }
 });
 
-// ─── OPTIONS for CORS Preflight ────────────────────────────
 app.options('/proxy/game', (req, res) => {
   res.set({
     'Access-Control-Allow-Origin': '*',
@@ -1442,20 +1299,206 @@ app.options('/proxy/asset', (req, res) => {
   res.sendStatus(204);
 });
 
-// ─── 404 handler ────────────────────────────────────────────
-// FIX: previously any unmatched route outside /proxy/* fell through with
-// Express's default plain-text 404, which is inconsistent with the JSON
-// error shape every other route in this app returns.
+// ════════════════════════════════════════════════════════════════
+//  🎬 GAME PREVIEW VIDEO — Puppeteer-based (Render compatible)
+//  Only generates for top ~100 games to save memory + storage.
+//  Uses ffmpeg-static so no system ffmpeg install is needed.
+// ════════════════════════════════════════════════════════════════
+
+const puppeteer = require('puppeteer');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+if (ffmpegPath) {
+  ffmpeg.setFfmpegPath(ffmpegPath);
+}
+
+const PREVIEW_DIR = process.env.PREVIEW_DIR || path.join(__dirname, 'public', 'previews');
+try {
+  fs.mkdirSync(PREVIEW_DIR, { recursive: true });
+} catch (err) {
+  console.warn('[preview] could not create PREVIEW_DIR:', err.message);
+}
+
+// Prevent concurrent recordings of the same game
+const previewJobsInFlight = new Map();
+
+// Rate limit: max 5 preview generations per minute per IP
+const previewLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many preview requests. Please try again later.' },
+});
+
+app.get('/preview/:gameId', previewLimiter, async (req, res) => {
+  const { gameId } = req.params;
+
+  // Sanitize gameId to prevent path traversal
+  if (!/^[a-zA-Z0-9_-]+$/.test(gameId)) {
+    return res.status(400).json({ error: 'Invalid game ID' });
+  }
+
+  const videoPath = path.join(PREVIEW_DIR, `${gameId}.mp4`);
+
+  // Serve cached preview if exists
+  if (fs.existsSync(videoPath)) {
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(videoPath);
+  }
+
+  // If a recording is already in progress for this game, wait for it
+  if (previewJobsInFlight.has(gameId)) {
+    try {
+      await previewJobsInFlight.get(gameId);
+      if (fs.existsSync(videoPath)) {
+        res.set('Cache-Control', 'public, max-age=86400');
+        return res.sendFile(videoPath);
+      }
+    } catch {}
+    return res.status(500).json({ error: 'Preview generation failed' });
+  }
+
+  // Only generate for top 100 games (saves memory + storage)
+  const games = await getGames();
+  const game = games.find((g) => g.id === gameId);
+  if (!game || !game.url) {
+    return res.status(404).json({ error: 'Game not found' });
+  }
+  if (typeof game.feedRank === 'number' && game.feedRank >= 100) {
+    // Non-top games: 404 so frontend falls back to image hover
+    return res.status(404).json({ error: 'Preview not available for this game' });
+  }
+
+  // Start new recording job
+  const job = (async () => {
+    const executablePath =
+      process.env.PUPPETEER_EXECUTABLE_PATH ||
+      (typeof puppeteer.executablePath === 'function' ? puppeteer.executablePath() : undefined);
+
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--single-process',
+        '--no-zygote',
+      ],
+    });
+
+    try {
+      const page = await browser.newPage();
+      await page.setViewport({ width: 640, height: 480, deviceScaleFactor: 1 });
+
+      const client = await page.createCDPSession();
+      const frames = [];
+
+      await client.send('Page.startScreencast', {
+        format: 'jpeg',
+        quality: 55,
+        maxWidth: 640,
+        maxHeight: 480,
+      });
+
+      client.on('Page.screencastFrame', async (frame) => {
+        frames.push(frame.data);
+        try {
+          await client.send('Page.screencastFrameAck', {
+            sessionId: frame.sessionId,
+          });
+        } catch {}
+      });
+
+      // Load the game through our own proxy
+      const proxyUrl = `${PUBLIC_BASE_URL}/proxy/game?url=${encodeURIComponent(game.url)}`;
+      await page.goto(proxyUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000,
+      });
+
+      // Record for ~4 seconds
+      await new Promise((r) => setTimeout(r, 4000));
+
+      await client.send('Page.stopScreencast');
+      await browser.close();
+
+      if (frames.length < 10) {
+        throw new Error('Not enough frames recorded');
+      }
+
+      // Write frames to temp dir
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `sharx-preview-${gameId}-`));
+
+      frames.forEach((data, i) => {
+        fs.writeFileSync(
+          path.join(tempDir, `frame-${String(i).padStart(5, '0')}.jpg`),
+          Buffer.from(data, 'base64')
+        );
+      });
+
+      // Convert frames to MP4 (10 fps)
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(path.join(tempDir, 'frame-%05d.jpg'))
+          .inputFPS(10)
+          .outputOptions([
+            '-c:v libx264',
+            '-pix_fmt yuv420p',
+            '-movflags +faststart',
+            '-preset veryfast',
+            '-crf 30',
+          ])
+          .size('640x480')
+          .output(videoPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      });
+
+      // Cleanup temp frames
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+
+      return true;
+    } catch (err) {
+      try {
+        await browser.close();
+      } catch {}
+      throw err;
+    }
+  })();
+
+  previewJobsInFlight.set(gameId, job);
+
+  try {
+    await job;
+    previewJobsInFlight.delete(gameId);
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.sendFile(videoPath);
+  } catch (err) {
+    previewJobsInFlight.delete(gameId);
+    console.error('[preview] failed for', gameId, '-', err.message);
+    return res.status(500).json({ error: 'Preview generation failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  404 + FINAL ERROR HANDLER — MUST BE LAST
+// ════════════════════════════════════════════════════════════════
+
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// ─── Final error handler ────────────────────────────────────
-// FIX: no app-level error-handling middleware existed. A synchronous
-// throw inside a route not wrapped in try/catch would be caught by
-// Express itself, but returned an HTML stack-trace page by default —
-// leaking internal file paths/stack traces to clients in production.
-// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error('❌ [unhandled route error]', err);
   if (res.headersSent) return next(err);
@@ -1469,7 +1512,6 @@ app.use((err, req, res, next) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Playvora Server running on port ${PORT}`);
   console.log(`📱 Local:   http://localhost:${PORT}`);
-  console.log(`🌐 Network: http://<your-ip>:${PORT}`);
   console.log(`🌐 Public base URL (used for ad-block runtime): ${PUBLIC_BASE_URL}`);
   if (PUBLIC_BASE_URL.includes('localhost')) {
     console.log(`⚠️  PUBLIC_BASE_URL is not set — ad-block runtime script will 404 for real visitors.`);
@@ -1477,18 +1519,21 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log(`✅ Games routes ready:`);
   console.log(`   - /games?page=&category=      (paginated, multi-page GameMonetize fetch)`);
+  console.log(`   - /games/trending              (top games by feedRank)`);
   console.log(`   - /categories                  (list of available categories)`);
   console.log(`   - /stats                       (games cache + adblock status)`);
   console.log('');
   console.log(`✅ Proxy routes ready:`);
-  console.log(`   - /proxy/game?url=<gameUrl>  (HTML games with ad-blocking)`);
-  console.log(`   - /proxy/asset?url=<assetUrl> (All assets: JS, CSS, images, audio, video)`);
-  console.log(`   - /proxy/<relative-path>      (fallback for paths games build at runtime)`);
+  console.log(`   - /proxy/game?url=<gameUrl>   (HTML games with ad-blocking)`);
+  console.log(`   - /proxy/asset?url=<assetUrl> (All assets)`);
+  console.log(`   - /proxy/<relative-path>      (fallback for runtime paths)`);
+  console.log('');
+  console.log(`✅ Preview routes ready:`);
+  console.log(`   - /preview/:gameId            (Puppeteer screen recording → MP4)`);
+  console.log(`     Only top 100 games are supported (feedRank < 100).`);
   console.log('');
   adblock.startBlocklistAutoRefresh();
 
-  // Warm the games cache immediately instead of waiting for the first
-  // real visitor to eat the ~1-2s cold-fetch cost.
   getGames()
     .then(games => console.log(`🎮 Preloaded ${games.length} games successfully!`))
     .catch(err => console.error('❌ Failed to preload games:', err.message));
