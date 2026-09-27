@@ -47,6 +47,9 @@ const prisma = require('./lib/prisma');
 const passkeyRoutes = require('./routes/passkey');
 const userRoutes = require('./routes/userRoutes');
 const authRoutes = require('./routes/auth');
+const rewardRoutes = require('./routes/rewards');
+const withdrawalRoutes = require('./routes/withdrawals');
+const referralRoutes = require('./routes/referrals');
 require('./Controllers/authController'); // side-effects (passport config)
 
 // ─── Required env vars — fail fast with a clear message ────
@@ -565,6 +568,9 @@ app.get('/', (req, res) => res.send('🎮 Playvora Gaming Server running 🚀'))
 app.use('/user', userRoutes);
 app.use('/auth', authRoutes);
 app.use('/passkey', passkeyRoutes);
+app.use('/rewards', rewardRoutes);
+app.use('/withdrawals', withdrawalRoutes);
+app.use('/referrals', referralRoutes);
 
 // ════════════════════════════════════════════════════════════════
 //  🎮 GAMES — multi-page parallel fetch, cached, filterable
@@ -1064,108 +1070,46 @@ const contactLimiter = rateLimit({
   message: { success: false, message: 'Too many messages sent. Please try again later.' },
 });
 
-const CONTACT_REASONS = new Set([
-  'General question',
-  'Account or login issue',
-  'Report a broken game',
-  'Report inappropriate content',
-  'Bug or technical problem',
-  'Feedback or suggestion',
-  'Business inquiry',
-  'Game submission',
-  'Other',
-]);
-
 app.post('/contact', contactLimiter, async (req, res) => {
   try {
-    const { name, email, message, topic, game, website } = req.body || {};
-
-    // Honeypot: real users never fill this hidden field.
-    if (typeof website === 'string' && website.trim()) {
-      return res.json({ success: true, message: 'Message sent successfully' });
-    }
-
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      return res.status(400).json({ success: false, message: 'Name is required' });
-    }
-    if (name.trim().length > 80) {
-      return res.status(400).json({ success: false, message: 'Name is too long' });
+    const { name, email, message, topic } = req.body;
+    if (!name || !email || !message) {
+      return res.status(400).json({ message: 'All fields required' });
     }
     if (!isValidEmail(email)) {
-      return res.status(400).json({ success: false, message: 'A valid email is required' });
+      return res.status(400).json({ message: 'A valid email is required' });
     }
-    if (email.length > 120) {
-      return res.status(400).json({ success: false, message: 'Email is too long' });
-    }
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      return res.status(400).json({ success: false, message: 'Message is required' });
-    }
-    if (message.trim().length < 4) {
-      return res.status(400).json({ success: false, message: 'Message is too short' });
-    }
-    if (message.length > 2000) {
-      return res.status(400).json({ success: false, message: 'Message is too long' });
-    }
-    if (typeof topic !== 'string' || !CONTACT_REASONS.has(topic)) {
-      return res.status(400).json({ success: false, message: 'Invalid contact topic' });
-    }
-    if (typeof game !== 'undefined' && game !== null && String(game).length > 200) {
-      return res.status(400).json({ success: false, message: 'Game information is too long' });
+    if (String(message).length > 5000) {
+      return res.status(400).json({ message: 'Message is too long' });
     }
 
-    if (!process.env.RESEND_API_KEY) {
-      console.error('[contact] RESEND_API_KEY is not configured');
-      return res.status(503).json({ success: false, message: 'Contact service is temporarily unavailable' });
-    }
+    const safeName = escapeHtml(name);
+    const safeEmail = escapeHtml(email);
+    const safeTopic = escapeHtml(topic || 'General');
+    const safeMessage = escapeHtml(message).replace(/\n/g, '<br>');
 
-    const safeName = escapeHtml(name.trim());
-    const safeEmail = escapeHtml(email.trim());
-    const safeTopic = escapeHtml(topic);
-    const safeGame = escapeHtml(String(game || '').trim());
-    const safeMessage = escapeHtml(message.trim()).replace(/\n/g, '<br>');
-    const inbox = process.env.CONTACT_INBOX_EMAIL || 'vishalxr92@gmail.com';
-    const from = process.env.CONTACT_FROM_EMAIL || 'SHARX <onboarding@resend.dev>';
-
-    const result = await resend.emails.send({
-      from,
-      to: inbox,
-      replyTo: email.trim(),
-      subject: `SHARX Contact — ${topic}`,
-      text: [
-        `Name: ${name.trim()}`,
-        `Email: ${email.trim()}`,
-        `Topic: ${topic}`,
-        game ? `Game: ${String(game).trim()}` : '',
-        '',
-        message.trim(),
-      ].filter(Boolean).join('\n'),
+    await resend.emails.send({
+      from: 'Playvora <onboarding@resend.dev>',
+      to: process.env.CONTACT_INBOX_EMAIL || 'vishalxr92@gmail.com',
+      subject: `New ${safeTopic} Message | Playvora`,
       html: `
-        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:680px;margin:0 auto;padding:24px;color:#1B2A41;background:#FFFDF7;">
-          <div style="border:1px solid #1B2A41;border-radius:18px;padding:24px;background:#ffffff;">
-            <h2 style="margin:0 0 20px;font-size:24px;">New SHARX Contact Message</h2>
-            <p><strong>Name:</strong> ${safeName}</p>
-            <p><strong>Email:</strong> ${safeEmail}</p>
-            <p><strong>Topic:</strong> ${safeTopic}</p>
-            ${safeGame ? `<p><strong>Game:</strong> ${safeGame}</p>` : ''}
-            <div style="margin-top:20px;padding:16px;border-radius:12px;background:#FFF7E8;border:1px solid #1B2A41;">
-              <strong>Message</strong>
-              <div style="margin-top:10px;line-height:1.65;">${safeMessage}</div>
-            </div>
-            <p style="margin:20px 0 0;color:#6b7280;font-size:12px;">Reply to this email to respond directly to the sender.</p>
+        <div style="font-family:sans-serif;padding:20px">
+          <h2>New Contact Message</h2>
+          <p><b>Name:</b> ${safeName}</p>
+          <p><b>Email:</b> ${safeEmail}</p>
+          <p><b>Topic:</b> ${safeTopic}</p>
+          <p><b>Message:</b></p>
+          <div style="background:#f5f5f5;padding:15px;border-radius:10px;">
+            ${safeMessage}
           </div>
         </div>
       `,
     });
 
-    if (result?.error) {
-      console.error('[contact] Resend error:', result.error);
-      return res.status(502).json({ success: false, message: 'Failed to send message' });
-    }
-
-    return res.json({ success: true, message: 'Message sent successfully' });
+    res.json({ success: true, message: 'Message sent successfully' });
   } catch (error) {
-    console.error('[contact] Send error:', error?.message || error);
-    return res.status(500).json({ success: false, message: 'Failed to send message' });
+    console.error('Contact error:', error);
+    res.status(500).json({ success: false, message: 'Failed to send message' });
   }
 });
 
