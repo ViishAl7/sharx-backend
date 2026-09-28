@@ -2,6 +2,7 @@
 
 const express = require("express");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 
 const authMiddleware = require("../middleware/authMiddleware");
 const prisma = require("../lib/prisma");
@@ -15,6 +16,10 @@ const {
 } = require("../services/rewardService");
 
 const router = express.Router();
+
+const rewardStartLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 12, standardHeaders: true, legacyHeaders: false });
+const rewardHeartbeatLimiter = rateLimit({ windowMs: 60 * 1000, max: 40, standardHeaders: true, legacyHeaders: false });
+const rewardEndLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
 
 /*
 |--------------------------------------------------------------------------
@@ -34,194 +39,36 @@ const router = express.Router();
 
 router.post("/webhook/razorpayx", async (req, res) => {
   try {
-    const signature =
-      req.headers["x-razorpay-signature"];
+    const signature = req.headers["x-razorpay-signature"];
+    const webhookSecret = process.env.RAZORPAYX_WEBHOOK_SECRET;
 
-    const webhookSecret =
-      process.env.RAZORPAYX_WEBHOOK_SECRET;
-
-    // Secret must exist
-    if (!webhookSecret) {
-      console.error(
-        "❌ RAZORPAYX_WEBHOOK_SECRET is not configured."
-      );
-
-      return res.status(500).json({
-        success: false,
-        error: "Webhook secret not configured.",
-      });
+    if (!webhookSecret || !req.rawBody || typeof signature !== "string") {
+      return res.status(400).json({ success: false, error: "Invalid webhook request." });
     }
 
-    // Razorpay signature must exist
-    if (!signature) {
-      console.warn(
-        "⚠️ RazorpayX webhook missing signature."
-      );
-
-      return res.status(400).json({
-        success: false,
-        error: "Missing Razorpay signature.",
-      });
+    const expected = crypto.createHmac("sha256", webhookSecret).update(req.rawBody).digest("hex");
+    const received = Buffer.from(signature, "utf8");
+    const expectedBuffer = Buffer.from(expected, "utf8");
+    if (received.length !== expectedBuffer.length || !crypto.timingSafeEqual(received, expectedBuffer)) {
+      return res.status(400).json({ success: false, error: "Invalid webhook signature." });
     }
 
-    // Raw body is required for HMAC verification
-    if (!req.rawBody) {
-      console.error(
-        "❌ RazorpayX webhook raw body is missing."
-      );
+    const event = typeof req.body?.event === "string" ? req.body.event : "unknown";
+    const allowedEvents = new Set([
+      "payout.initiated", "payout.queued", "payout.pending", "payout.processed",
+      "payout.updated", "payout.rejected", "payout.reversed", "payout.failed",
+    ]);
+    if (!allowedEvents.has(event)) return res.status(200).json({ success: true, received: true, ignored: true });
 
-      return res.status(500).json({
-        success: false,
-        error: "Raw webhook body unavailable.",
-      });
-    }
+    const eventId = String(req.headers["x-razorpay-event-id"] || crypto.createHash("sha256").update(req.rawBody).digest("hex"));
+    const payloadHash = crypto.createHash("sha256").update(req.rawBody).digest("hex");
+    const { processRazorpayWebhook } = require("../services/withdrawalService");
+    const result = await processRazorpayWebhook({ eventId, event, payload: req.body, rawBodyHash: payloadHash });
 
-    /*
-     * Razorpay webhook signature:
-     *
-     * HMAC-SHA256(
-     *   raw request body,
-     *   webhook secret
-     * )
-     */
-    const expectedSignature =
-      crypto
-        .createHmac(
-          "sha256",
-          webhookSecret
-        )
-        .update(req.rawBody)
-        .digest("hex");
-
-    const receivedBuffer =
-      Buffer.from(
-        String(signature),
-        "utf8"
-      );
-
-    const expectedBuffer =
-      Buffer.from(
-        expectedSignature,
-        "utf8"
-      );
-
-    /*
-     * timingSafeEqual requires buffers
-     * of the same length.
-     */
-    const signatureValid =
-      receivedBuffer.length ===
-        expectedBuffer.length &&
-      crypto.timingSafeEqual(
-        receivedBuffer,
-        expectedBuffer
-      );
-
-    if (!signatureValid) {
-      console.warn(
-        "⚠️ Invalid RazorpayX webhook signature."
-      );
-
-      return res.status(400).json({
-        success: false,
-        error: "Invalid webhook signature.",
-      });
-    }
-
-    /*
-     * Signature is valid.
-     *
-     * At this stage we know the request genuinely came
-     * through Razorpay's signed webhook mechanism.
-     */
-    const event = req.body?.event || "unknown";
-
-    console.log(
-      `✅ RazorpayX webhook received: ${event}`
-    );
-
-    /*
-     * Keep the payload available for the next stage
-     * where we will process:
-     *
-     * payout.initiated
-     * payout.queued
-     * payout.pending
-     * payout.processed
-     * payout.updated
-     * payout.rejected
-     * payout.reversed
-     */
-
-    switch (event) {
-      case "payout.initiated":
-        console.log(
-          "💸 RazorpayX payout initiated."
-        );
-        break;
-
-      case "payout.queued":
-        console.log(
-          "⏳ RazorpayX payout queued."
-        );
-        break;
-
-      case "payout.pending":
-        console.log(
-          "⏳ RazorpayX payout pending."
-        );
-        break;
-
-      case "payout.processed":
-        console.log(
-          "✅ RazorpayX payout processed."
-        );
-        break;
-
-      case "payout.updated":
-        console.log(
-          "🔄 RazorpayX payout updated."
-        );
-        break;
-
-      case "payout.rejected":
-        console.log(
-          "❌ RazorpayX payout rejected."
-        );
-        break;
-
-      case "payout.reversed":
-        console.log(
-          "↩️ RazorpayX payout reversed."
-        );
-        break;
-
-      default:
-        console.log(
-          `ℹ️ Unhandled RazorpayX event: ${event}`
-        );
-    }
-
-    /*
-     * Always acknowledge a valid webhook.
-     * Actual Withdrawal/Wallet state changes will be
-     * connected here after the endpoint is verified.
-     */
-    return res.status(200).json({
-      success: true,
-      received: true,
-      event,
-    });
+    return res.status(200).json({ success: true, received: true, event, ...result });
   } catch (error) {
-    console.error(
-      "❌ RazorpayX webhook error:",
-      error
-    );
-
-    return res.status(500).json({
-      success: false,
-      error: "Webhook processing failed.",
-    });
+    console.error("❌ RazorpayX webhook error:", error);
+    return res.status(500).json({ success: false, error: "Webhook processing failed." });
   }
 });
 
@@ -335,6 +182,7 @@ router.get("/history", async (req, res) => {
 
 router.post(
   "/session/start",
+  rewardStartLimiter,
   async (req, res) => {
     try {
       const gameId =
@@ -372,10 +220,7 @@ router.post(
           publicSession(session),
       });
     } catch (error) {
-      if (
-        error.code ===
-        "ACTIVE_SESSION_EXISTS"
-      ) {
+      if (error.code === "ACTIVE_SESSION_EXISTS" || error.code === "P2002" || error.code === "P2034") {
         return res.status(409).json({
           success: false,
           code: error.code,
@@ -405,6 +250,7 @@ router.post(
 
 router.post(
   "/session/heartbeat",
+  rewardHeartbeatLimiter,
   async (req, res) => {
     try {
       const sessionId =
@@ -476,6 +322,7 @@ router.post(
 
 router.post(
   "/session/end",
+  rewardEndLimiter,
   async (req, res) => {
     try {
       const sessionId =

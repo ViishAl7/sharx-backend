@@ -8,6 +8,29 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+enum RewardSessionStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
+  REVOKED
+}
+
+enum RewardLedgerType {
+  TIME_REWARD
+  REFERRAL_REWARD
+  ADJUSTMENT
+  WITHDRAWAL
+  WITHDRAWAL_REVERSAL
+}
+
+enum WithdrawalStatus {
+  PENDING
+  PROCESSING
+  PAID
+  REJECTED
+  CANCELLED
+}
+
 model User {
   id          Int     @id @default(autoincrement())
   name        String
@@ -16,28 +39,27 @@ model User {
   googleId    String? @unique
   avatar      String?
   score       Int     @default(0)
+  tokenVersion Int    @default(0)
   microsoftId String? @unique
 
-  // FIX: passkey data was previously stored in an in-memory JS object
-  // (`const users = {}` in routes/passkey.js), which meant every
-  // registered passkey was WIPED on every server restart/deploy/crash.
-  // Moving it into the User row itself makes it durable, and makes a
-  // passkey just another login method tied to the same account as
-  // Google/Microsoft — consistent with how googleId/microsoftId work.
   passkeyCredentialId String? @unique
   passkeyPublicKey    Bytes?
   passkeyCounter      Int?
 
-  // FIX: the WebAuthn registration/login "challenge" used to live in a
-  // single shared `router._pendingChallenge` variable — one challenge
-  // for the entire server, for every user, at once. Two people
-  // registering or logging in with a passkey at the same moment would
-  // silently overwrite each other's challenge and fail verification.
-  // Storing it per-user (with an expiry) fixes that.
   currentChallenge          String?
   currentChallengeExpiresAt DateTime?
 
   matches Match[]
+
+  rewardWallet     RewardWallet?
+  rewardSessions   RewardSession[]
+  rewardLedger     RewardLedger[]
+  rewardMilestones RewardMilestone[]
+  referralsMade    Referral[]        @relation("Referrer")
+  referralReceived Referral?         @relation("Referred")
+  withdrawals      Withdrawal[]
+  passwordResetCodes PasswordResetCode[]
+  authExchangeCodes AuthExchangeCode[]
 }
 
 model Match {
@@ -47,4 +69,151 @@ model Match {
   createdAt DateTime @default(now())
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
+}
+
+model RewardWallet {
+  id                     Int      @id @default(autoincrement())
+  userId                 Int      @unique
+  balancePaise           BigInt   @default(0)
+  lifetimeEarnedPaise    BigInt   @default(0)
+  lifetimeWithdrawnPaise BigInt   @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ledger      RewardLedger[]
+  withdrawals Withdrawal[]
+}
+
+model RewardLedger {
+  id                Int              @id @default(autoincrement())
+  walletId          Int
+  userId            Int
+  type              RewardLedgerType
+  amountPaise       BigInt
+  balanceAfterPaise BigInt
+  referenceKey      String           @unique
+  description       String
+  metadata          Json?
+  createdAt         DateTime         @default(now())
+
+  wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
+}
+
+model RewardSession {
+  id                 String              @id @default(cuid())
+  userId             Int
+  gameId             String
+  status             RewardSessionStatus @default(ACTIVE)
+  startedAt          DateTime            @default(now())
+  lastHeartbeatAt    DateTime            @default(now())
+  endedAt            DateTime?
+  qualifiedSeconds   Int                 @default(0)
+  rewardedMilestones Int                 @default(0)
+  clientInstanceId   String
+  ipHash             String?
+  userAgentHash      String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+}
+
+model RewardMilestone {
+  id               Int      @id @default(autoincrement())
+  userId           Int
+  sessionId        String
+  milestoneSeconds Int
+  rewardPaise      Int
+  referenceKey     String   @unique
+  createdAt        DateTime @default(now())
+  user             User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([sessionId])
+}
+
+model Referral {
+  id             Int       @id @default(autoincrement())
+  referrerUserId Int
+  referredUserId Int       @unique
+  code           String    @unique
+  qualifiedAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  referrer User @relation("Referrer", fields: [referrerUserId], references: [id], onDelete: Cascade)
+  referred User @relation("Referred", fields: [referredUserId], references: [id], onDelete: Cascade)
+
+  @@index([referrerUserId])
+}
+
+model Withdrawal {
+  id          String           @id @default(cuid())
+  walletId    Int
+  userId      Int
+  amountPaise BigInt
+  method      String
+  destination String
+  status      WithdrawalStatus @default(PENDING)
+  note        String?
+  createdAt   DateTime         @default(now())
+  processedAt DateTime?
+  updatedAt   DateTime @updatedAt
+  providerPayoutId     String? @unique
+  providerFundAccountId String?
+  providerReferenceId  String?
+  idempotencyKey       String? @unique
+  failureReason       String?
+
+  wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+
+model PasswordResetCode {
+  id        String   @id @default(cuid())
+  userId    Int
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([codeHash])
+}
+
+model AuthExchangeCode {
+  id        String   @id @default(cuid())
+  userId    Int
+  codeHash  String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model WebhookEvent {
+  id          String   @id
+  provider    String
+  event       String
+  payloadHash String
+  createdAt   DateTime @default(now())
+
+  @@index([provider, createdAt])
 }

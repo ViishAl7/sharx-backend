@@ -3,7 +3,6 @@
 const passport = require("passport");
 const GoogleStrategy = require("passport-google-oauth20").Strategy;
 const MicrosoftStrategy = require("passport-microsoft").Strategy;
-const jwt = require("jsonwebtoken");
 const prisma = require("../lib/prisma");
 
 // FIX: previously this file created its OWN `new PrismaClient()` — a
@@ -66,7 +65,7 @@ passport.use(
       try {
         // Google can theoretically omit email if the scope/consent didn't
         // include it — guard here too, not just for Microsoft.
-        const email = profile.emails?.[0]?.value;
+        const email = profile.emails?.[0]?.value?.trim().toLowerCase();
         if (!email) {
           return done(new Error("Google account has no accessible email address. Cannot create account."), null);
         }
@@ -103,13 +102,7 @@ passport.use(
           return existingUser;
         });
 
-        const token = jwt.sign(
-          { id: user.id, email: user.email },
-          process.env.JWT_SECRET,
-          { expiresIn: "7d" }
-        );
-
-        return done(null, { ...user, token });
+        return done(null, user);
       } catch (error) {
         console.error("Google Auth Error:", error.message);
         return done(error, null);
@@ -135,7 +128,7 @@ passport.use(
         // Since `email` is a required, unique field in the schema,
         // calling prisma.user.create() with email: undefined would throw
         // and crash this auth attempt. Fail cleanly instead.
-        const email = profile.emails?.[0]?.value;
+        const email = profile.emails?.[0]?.value?.trim().toLowerCase();
 
         if (!email) {
           return done(
@@ -176,13 +169,7 @@ passport.use(
           return existingUser;
         });
 
-        const token = jwt.sign(
-          { id: user.id, email: user.email },
-          process.env.JWT_SECRET,
-          { expiresIn: "7d" }
-        );
-
-        return done(null, { ...user, token });
+        return done(null, user);
       } catch (error) {
         console.error("Microsoft Auth Error:", error.message);
         return done(error, null);
@@ -190,19 +177,5 @@ passport.use(
     }
   )
 );
-
-passport.serializeUser((user, done) => {
-  done(null, user.id);
-});
-
-passport.deserializeUser(async (id, done) => {
-  try {
-    const user = await prisma.user.findUnique({ where: { id } });
-    done(null, user);
-  } catch (error) {
-    console.error("DeserializeUser Error:", error.message);
-    done(error, null);
-  }
-});
 
 module.exports = passport;

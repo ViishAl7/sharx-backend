@@ -13,6 +13,8 @@ const SESSION_IDLE_TIMEOUT_SECONDS = 2 * 60;
 // Maximum total time-reward earnings per user per day.
 // ₹100 = 10,000 paise.
 const DAILY_REWARD_CAP_PAISE = 10000;
+const MIN_WITHDRAWAL_PAISE = 1000;
+const MAX_WITHDRAWAL_PAISE = 1000000;
 
 // Server-controlled reward amounts.
 // The browser never chooses the reward amount.
@@ -48,5 +50,7 @@ module.exports = {
   HEARTBEAT_GRACE_SECONDS,
   SESSION_IDLE_TIMEOUT_SECONDS,
   DAILY_REWARD_CAP_PAISE,
+  MIN_WITHDRAWAL_PAISE,
+  MAX_WITHDRAWAL_PAISE,
   deterministicReward,
 };

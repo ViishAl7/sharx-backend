@@ -1,7 +1,7 @@
 {
   "name": "gaming-backend",
   "version": "1.0.1",
-  "description": "Playvora gaming backend — auth, games feed, ad-block proxy, realtime leaderboard",
+  "description": "Playvora gaming backend \u2014 auth, games feed, ad-block proxy, realtime leaderboard",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -9,7 +9,10 @@
     "test": "node backend.test.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "test:deep": "node backend.deep.test.js",
+    "prisma:validate": "prisma validate",
+    "security:syntax": "node --check index.js && node --check middleware/authMiddleware.js && node --check routes/auth.js && node --check routes/passkey.js && node --check routes/rewards.js && node --check routes/withdrawals.js && node --check services/rewardService.js && node --check services/withdrawalService.js && node --check services/razorpayxService.js"
   },
   "keywords": [],
   "author": "",
@@ -20,12 +23,10 @@
     "bcrypt": "^6.0.0",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
-    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^7.4.1",
-    "express-session": "^1.19.0",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
     "helmet": "^8.0.0",

@@ -38,12 +38,9 @@ function cleanClientInstanceId(value) {
 }
 
 function getIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-
-  if (typeof forwarded === "string" && forwarded.length > 0) {
-    return forwarded.split(",")[0].trim();
-  }
-
+  // Express resolves the client IP according to the configured trust proxy.
+  // Do not parse X-Forwarded-For manually because an untrusted caller can
+  // otherwise inject arbitrary values into the fingerprint.
   return req.ip || req.socket?.remoteAddress || "";
 }
 
@@ -321,411 +318,129 @@ async function creditMilestone(
    START SESSION
 ========================================================= */
 
-async function startSession({
-  userId,
-  gameId,
-  clientInstanceId,
-  req,
-}) {
-  if (!gameId) {
-    throw new Error("Game ID is required.");
-  }
+async function startSession({ userId, gameId, clientInstanceId, req }) {
+  if (!gameId) throw new Error('Game ID is required.');
+  if (!clientInstanceId) throw new Error('Client instance ID is required.');
 
-  if (!clientInstanceId) {
-    throw new Error(
-      "Client instance ID is required."
-    );
-  }
+  const cleanClient = cleanClientInstanceId(clientInstanceId);
+  const cleanGame = cleanGameId(gameId);
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - SESSION_IDLE_TIMEOUT_SECONDS * 1000);
 
-  /*
-   * Expire:
-   *
-   * 1. Same client old active session
-   * 2. Any session that has been idle too long
-   */
-
-  await prisma.rewardSession.updateMany({
-    where: {
-      userId,
-      status: "ACTIVE",
-      OR: [
-        {
-          clientInstanceId,
-        },
-        {
-          lastHeartbeatAt: {
-            lt: new Date(
-              Date.now() -
-                SESSION_IDLE_TIMEOUT_SECONDS * 1000
-            ),
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        await tx.rewardSession.updateMany({
+          where: {
+            userId,
+            status: 'ACTIVE',
+            OR: [
+              { clientInstanceId: cleanClient },
+              { lastHeartbeatAt: { lt: staleBefore } },
+            ],
           },
-        },
-      ],
-    },
-    data: {
-      status: "EXPIRED",
-      endedAt: new Date(),
-    },
-  });
+          data: { status: 'EXPIRED', endedAt: now },
+        });
 
-  /*
-   * Prevent multiple simultaneously active sessions
-   * for the same user.
-   */
+        const active = await tx.rewardSession.findFirst({
+          where: { userId, status: 'ACTIVE' },
+          select: { id: true, clientInstanceId: true, lastHeartbeatAt: true },
+        });
 
-  const alreadyActive =
-    await prisma.rewardSession.findFirst({
-      where: {
-        userId,
-        status: "ACTIVE",
-        clientInstanceId: {
-          not: clientInstanceId,
-        },
-      },
-    });
+        if (active) {
+          const error = new Error('Another active play session already exists.');
+          error.code = 'ACTIVE_SESSION_EXISTS';
+          throw error;
+        }
 
-  if (alreadyActive) {
-    const age =
-      Date.now() -
-      new Date(
-        alreadyActive.lastHeartbeatAt
-      ).getTime();
-
-    if (
-      age <
-      SESSION_IDLE_TIMEOUT_SECONDS * 1000
-    ) {
-      const error = new Error(
-        "Another active play session already exists."
-      );
-
-      error.code =
-        "ACTIVE_SESSION_EXISTS";
-
+        return tx.rewardSession.create({
+          data: {
+            userId,
+            gameId: cleanGame,
+            clientInstanceId: cleanClient,
+            ipHash: hashValue(getIp(req)),
+            userAgentHash: hashValue(getUserAgent(req)),
+          },
+        });
+      }, { isolationLevel: 'Serializable' });
+    } catch (error) {
+      if (error.code === 'P2034' && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        continue;
+      }
+      if (error.code === 'P2002') {
+        error.code = 'ACTIVE_SESSION_EXISTS';
+      }
       throw error;
     }
-
-    await prisma.rewardSession.update({
-      where: {
-        id: alreadyActive.id,
-      },
-      data: {
-        status: "EXPIRED",
-        endedAt: new Date(),
-      },
-    });
   }
-
-  /*
-   * Create new server-authoritative session.
-   */
-
-  const session =
-    await prisma.rewardSession.create({
-      data: {
-        userId,
-        gameId: cleanGameId(gameId),
-        clientInstanceId:
-          cleanClientInstanceId(
-            clientInstanceId
-          ),
-        ipHash: hashValue(
-          getIp(req)
-        ),
-        userAgentHash:
-          hashValue(
-            getUserAgent(req)
-          ),
-      },
-    });
-
-  return session;
+  throw new Error('Could not start reward session.');
 }
 
 /* =========================================================
    HEARTBEAT
 ========================================================= */
 
-async function heartbeatSession({
-  userId,
-  sessionId,
-  clientInstanceId,
-}) {
-  const session =
-    await prisma.rewardSession.findFirst({
-      where: {
-        id: sessionId,
-        userId,
-        status: "ACTIVE",
-      },
-    });
-
-  if (!session) {
-    const error = new Error(
-      "Reward session is no longer active."
-    );
-
-    error.code =
-      "SESSION_NOT_ACTIVE";
-
+async function heartbeatSession({ userId, sessionId, clientInstanceId }) {
+  const cleanClient = cleanClientInstanceId(clientInstanceId);
+  if (!sessionId || !cleanClient) {
+    const error = new Error('Invalid reward heartbeat.');
+    error.code = 'SESSION_INVALID';
     throw error;
   }
 
-  /*
-   * Make sure heartbeat belongs to the same browser
-   * instance that started the session.
-   */
-
-  if (
-    session.clientInstanceId !==
-    clientInstanceId
-  ) {
-    const error = new Error(
-      "Invalid play session."
-    );
-
-    error.code =
-      "SESSION_CLIENT_MISMATCH";
-
-    throw error;
-  }
-
-  const now = new Date();
-
-  const last =
-    new Date(
-      session.lastHeartbeatAt
-    );
-
-  let deltaSeconds = Math.floor(
-    (
-      now.getTime() -
-      last.getTime()
-    ) / 1000
-  );
-
-  /*
-   * Never allow negative time.
-   */
-
-  if (deltaSeconds < 0) {
-    deltaSeconds = 0;
-  }
-
-  /*
-   * Never credit more than heartbeat grace
-   * for one request.
-   */
-
-  deltaSeconds = Math.min(
-    deltaSeconds,
-    HEARTBEAT_GRACE_SECONDS
-  );
-
-  const newQualifiedSeconds =
-    session.qualifiedSeconds +
-    deltaSeconds;
-
-  const oldMilestones =
-    session.rewardedMilestones;
-
-  const newMilestones =
-    Math.floor(
-      newQualifiedSeconds /
-        MILESTONE_SECONDS
-    );
-
-  const earned = [];
-
-  /*
-   * Serializable transaction reduces the possibility
-   * of concurrent heartbeat races.
-   */
-
-  await prisma.$transaction(
-    async (tx) => {
-      /*
-       * Re-read the session INSIDE the transaction.
-       *
-       * This is important when two heartbeats arrive
-       * almost at the same time.
-       */
-
-      const current =
-        await tx.rewardSession.findUnique({
-          where: {
-            id: session.id,
-          },
-        });
-
-      if (!current) {
-        const error = new Error(
-          "Reward session no longer exists."
-        );
-
-        error.code =
-          "SESSION_NOT_ACTIVE";
-
-        throw error;
-      }
-
-      if (
-        current.userId !== userId ||
-        current.status !== "ACTIVE"
-      ) {
-        const error = new Error(
-          "Reward session is no longer active."
-        );
-
-        error.code =
-          "SESSION_NOT_ACTIVE";
-
-        throw error;
-      }
-
-      if (
-        current.clientInstanceId !==
-        clientInstanceId
-      ) {
-        const error = new Error(
-          "Invalid play session."
-        );
-
-        error.code =
-          "SESSION_CLIENT_MISMATCH";
-
-        throw error;
-      }
-
-      /*
-       * Recalculate from the actual current DB state.
-       */
-
-      const currentNow = new Date();
-
-      const currentLast =
-        new Date(
-          current.lastHeartbeatAt
-        );
-
-      let currentDeltaSeconds =
-        Math.floor(
-          (
-            currentNow.getTime() -
-            currentLast.getTime()
-          ) / 1000
-        );
-
-      if (currentDeltaSeconds < 0) {
-        currentDeltaSeconds = 0;
-      }
-
-      currentDeltaSeconds =
-        Math.min(
-          currentDeltaSeconds,
-          HEARTBEAT_GRACE_SECONDS
-        );
-
-      const updatedQualifiedSeconds =
-        current.qualifiedSeconds +
-        currentDeltaSeconds;
-
-      const updatedMilestones =
-        Math.floor(
-          updatedQualifiedSeconds /
-            MILESTONE_SECONDS
-        );
-
-      /*
-       * Update session.
-       */
-
-      const updatedSession =
-        await tx.rewardSession.update({
-          where: {
-            id: current.id,
-          },
-          data: {
-            qualifiedSeconds:
-              updatedQualifiedSeconds,
-
-            rewardedMilestones:
-              updatedMilestones,
-
-            lastHeartbeatAt:
-              currentNow,
-          },
-        });
-
-      /*
-       * Process only newly crossed milestones.
-       *
-       * creditMilestone() itself only allows #1.
-       */
-
-      for (
-        let milestone =
-          current.rewardedMilestones + 1;
-
-        milestone <=
-        updatedMilestones;
-
-        milestone += 1
-      ) {
-        const ledger =
-          await creditMilestone(
-            tx,
-            updatedSession,
-            milestone
-          );
-
-        if (ledger) {
-          earned.push(ledger);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const earned = [];
+    try {
+      let response;
+      await prisma.$transaction(async (tx) => {
+        const current = await tx.rewardSession.findUnique({ where: { id: sessionId } });
+        if (!current || current.userId !== userId || current.status !== 'ACTIVE') {
+          const error = new Error('Reward session is no longer active.');
+          error.code = 'SESSION_NOT_ACTIVE';
+          throw error;
         }
+        if (current.clientInstanceId !== cleanClient) {
+          const error = new Error('Invalid play session.');
+          error.code = 'SESSION_CLIENT_MISMATCH';
+          throw error;
+        }
+
+        const now = new Date();
+        const last = new Date(current.lastHeartbeatAt);
+        let delta = Math.floor((now.getTime() - last.getTime()) / 1000);
+        delta = Math.max(0, Math.min(delta, HEARTBEAT_GRACE_SECONDS));
+
+        const qualifiedSeconds = current.qualifiedSeconds + delta;
+        const milestones = Math.floor(qualifiedSeconds / MILESTONE_SECONDS);
+        const updated = await tx.rewardSession.update({
+          where: { id: current.id },
+          data: { qualifiedSeconds, rewardedMilestones: milestones, lastHeartbeatAt: now },
+        });
+
+        for (let milestone = current.rewardedMilestones + 1; milestone <= milestones; milestone += 1) {
+          const ledger = await creditMilestone(tx, updated, milestone);
+          if (ledger) earned.push(ledger);
+        }
+
+        response = { sessionId, qualifiedSeconds, rewardedMilestones: milestones };
+      }, { isolationLevel: 'Serializable' });
+
+      return { ...response, earned: earned.map((item) => ({
+        id: item.id,
+        amountPaise: Number(item.amountPaise),
+        amountRupees: Number(item.amountPaise) / 100,
+        description: item.description,
+      })) };
+    } catch (error) {
+      if (error.code === 'P2034' && attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+        continue;
       }
-
-      /*
-       * Return updated values through local variables.
-       */
-
-      session.qualifiedSeconds =
-        updatedQualifiedSeconds;
-
-      session.rewardedMilestones =
-        updatedMilestones;
-    },
-    {
-      isolationLevel:
-        "Serializable",
+      throw error;
     }
-  );
-
-  return {
-    sessionId,
-
-    qualifiedSeconds:
-      session.qualifiedSeconds,
-
-    rewardedMilestones:
-      session.rewardedMilestones,
-
-    earned: earned.map((item) => ({
-      id: item.id,
-
-      amountPaise:
-        Number(
-          item.amountPaise
-        ),
-
-      amountRupees:
-        Number(
-          item.amountPaise
-        ) / 100,
-
-      description:
-        item.description,
-    })),
-  };
+  }
+  throw new Error('Could not update reward session.');
 }
 
 /* =========================================================

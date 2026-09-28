@@ -33,12 +33,13 @@ const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
 const passport = require('passport');
-const session = require('express-session');
 const { Resend } = require('resend');
 const compression = require('compression');
 const cheerio = require('cheerio');
-const { Readable } = require('stream');
-const cookieParser = require('cookie-parser');
+const { Readable, Transform } = require('stream');
+const { randomInt } = require('crypto');
+const { signAccessToken, hashCode } = require('./lib/auth');
+const authMiddleware = require('./middleware/authMiddleware');
 
 const adblock = require('./lib/adblock');
 const prisma = require('./lib/prisma');
@@ -53,7 +54,13 @@ const referralRoutes = require('./routes/referrals');
 require('./Controllers/authController'); // side-effects (passport config)
 
 // ─── Required env vars — fail fast with a clear message ────
-const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL'];
+const REQUIRED_ENV = ['JWT_SECRET', 'DATABASE_URL', 'CLIENT_URL', 'PUBLIC_BASE_URL'];
+if (process.env.NODE_ENV === 'production') {
+  REQUIRED_ENV.push('ALLOWED_ORIGINS', 'PASSKEY_RP_ID', 'PASSKEY_ORIGIN');
+  if (process.env.RAZORPAYX_ENABLED === 'true') {
+    REQUIRED_ENV.push('RAZORPAYX_KEY_ID', 'RAZORPAYX_KEY_SECRET', 'RAZORPAYX_ACCOUNT_NUMBER', 'RAZORPAYX_WEBHOOK_SECRET');
+  }
+}
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length > 0) {
   console.error(`❌ Missing required environment variables: ${missingEnv.join(', ')}`);
@@ -61,14 +68,6 @@ if (missingEnv.length > 0) {
   process.exit(1);
 }
 
-if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
-  console.error('❌ SESSION_SECRET must be set in production. Refusing to start with an insecure default.');
-  process.exit(1);
-}
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev_only_insecure_session_secret_change_me';
-if (!process.env.SESSION_SECRET) {
-  console.warn('⚠️  SESSION_SECRET not set — using an insecure development-only default. Set SESSION_SECRET before deploying.');
-}
 
 // ─── Initialise ─────────────────────────────────────────────
 const app = express();
@@ -78,31 +77,19 @@ app.set('trust proxy', 1);
 const resend = new Resend(process.env.RESEND_API_KEY);
 const server = http.createServer(app);
 const PORT = process.env.PORT || 5001;
-const JWT_SECRET = process.env.JWT_SECRET;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
 // ─── Crash Guards ───────────────────────────────────────────
 process.on('uncaughtException', (err) => {
-  console.error('❌ [uncaughtException] This would have crashed the server:', err);
+  console.error('❌ [uncaughtException] Fatal error:', err);
+  process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('❌ [unhandledRejection] This would have crashed the server:', reason);
+  console.error('❌ [unhandledRejection] Fatal unhandled rejection:', reason);
+  process.exit(1);
 });
 
-// ─── OTP Store ──────────────────────────────────────────────
-const otpStore = new Map();
-const OTP_EXPIRY_MS = 10 * 60 * 1000;
-
-const otpCleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [email, entry] of otpStore.entries()) {
-    if (now > entry.expires) otpStore.delete(email);
-  }
-}, 5 * 60 * 1000);
-otpCleanupTimer.unref?.();
-
 // ─── Last Proxied Game URL ──────────────────────────────────
-let lastProxiedGameUrl = null;
 
 // ─── CORS ───────────────────────────────────────────────────
 const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
@@ -145,30 +132,18 @@ app.use(
 );
 
 // ─── Middleware ──────────────────────────────────────────────
-app.use(cookieParser());
 app.use(compression({
   filter: (req, res) => {
     if (req.path.startsWith('/proxy/')) return false;
     return compression.filter(req, res);
   },
 }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-app.use(
-  session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000,
-    },
-  })
-);
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, res, buf) => { req.rawBody = Buffer.from(buf); },
+}));
+app.use(express.urlencoded({ limit: '100kb', extended: true, parameterLimit: 100 }));
 app.use(passport.initialize());
-app.use(passport.session());
 
 // ─── Rate limiting ──────────────────────────────────────────
 const authLimiter = rateLimit({
@@ -265,22 +240,6 @@ function getOtpEmailHtml(otp, userName = 'Player') {
 </html>`;
 }
 
-// ─── Auth Middleware ────────────────────────────────────────
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ message: 'Authentication required' });
-  }
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch {
-    res.status(401).json({ message: 'Invalid or expired token' });
-  }
-}
-
 // ─── Validation helpers ─────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function isValidEmail(email) {
@@ -302,104 +261,134 @@ function getRank(score) {
 
 const assetProxyCache = adblock.createAssetCache({ maxEntries: 2000, ttlMs: 60 * 60 * 1000 });
 
-async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
-  const cached = assetProxyCache.get(url);
-  if (cached) {
-    return cached;
-  }
-
-  const safe = await adblock.isSafeTarget(url);
-  if (!safe) {
-    const error = new Error('Invalid or unsafe URL');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const targetUrl = new URL(url);
-    const upstream = await fetch(targetUrl.toString(), {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': targetUrl.origin,
-        'Origin': PUBLIC_BASE_URL,
-        'DNT': '1',
-      },
-      signal: controller.signal,
-      redirect: 'follow',
-    });
-
-    if (!upstream.ok) {
-      const error = new Error(`Upstream returned ${upstream.status}`);
-      error.statusCode = 502;
+async function fetchSafeUpstream(initialUrl, timeoutMs) {
+  let currentUrl = initialUrl;
+  for (let redirects = 0; redirects <= 5; redirects += 1) {
+    if (!(await adblock.isSafeTarget(currentUrl))) {
+      const error = new Error('Invalid or unsafe URL');
+      error.statusCode = 400;
       throw error;
     }
 
-    clearTimeout(timeoutId);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const parsed = new URL(currentUrl);
+      const upstream = await fetch(parsed.toString(), {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': '*/*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Referer': parsed.origin,
+          'Origin': PUBLIC_BASE_URL,
+          'DNT': '1',
+        },
+        signal: controller.signal,
+        redirect: 'manual',
+      });
 
-    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    let cacheControl = upstream.headers.get('cache-control') || 'public, max-age=3600';
+      if (upstream.status >= 300 && upstream.status < 400) {
+        const location = upstream.headers.get('location');
+        if (!location || redirects === 5) {
+          const error = new Error('Too many or invalid upstream redirects');
+          error.statusCode = 502;
+          throw error;
+        }
+        currentUrl = new URL(location, parsed).toString();
+        continue;
+      }
 
-    let buffer;
-    let finalContentType = contentType;
-
-    if (contentType.includes('text/html') && isHtmlGame) {
-      const html = await upstream.text();
-      const $ = cheerio.load(html);
-
-      adblock.stripAds($, targetUrl.toString(), PUBLIC_BASE_URL);
-      rewriteAssetUrls($, targetUrl.toString());
-
-      const swGuardTag = `<script>try{if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject(new Error('Service worker disabled by proxy'));};}}catch(e){}</script>`;
-      $('head').prepend(swGuardTag);
-
-      const runtimeScriptTag = `<script src="${PUBLIC_BASE_URL}/adblock-runtime.js"></script>`;
-      $('head').append(runtimeScriptTag);
-
-      const finalHtml = $.html();
-      buffer = Buffer.from(finalHtml, 'utf-8');
-      finalContentType = 'text/html; charset=utf-8';
-      cacheControl = 'no-cache';
-    } else if (contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
-      buffer = Buffer.from(await upstream.arrayBuffer());
-      finalContentType = 'application/javascript; charset=utf-8';
-    } else if (contentType.includes('text/css')) {
-      const cssText = await upstream.text();
-      const rewrittenCss = rewriteCssUrls(cssText, targetUrl.toString());
-      buffer = Buffer.from(rewrittenCss, 'utf-8');
-      finalContentType = 'text/css; charset=utf-8';
-      cacheControl = 'no-cache';
-    } else {
-      return {
-        stream: Readable.fromWeb(upstream.body),
-        contentType: finalContentType,
-        cacheControl,
-      };
+      if (!upstream.ok) {
+        const error = new Error(`Upstream returned ${upstream.status}`);
+        error.statusCode = 502;
+        throw error;
+      }
+      return { upstream, targetUrl: parsed };
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        const timeoutError = new Error('Request timeout');
+        timeoutError.statusCode = 504;
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
     }
-
-    const result = { buffer, contentType: finalContentType, cacheControl };
-    assetProxyCache.set(url, result);
-
-    return result;
-  } catch (error) {
-    if (error.statusCode) throw error;
-    if (error.name === 'AbortError') {
-      const err = new Error('Request timeout');
-      err.statusCode = 504;
-      throw err;
-    }
-    console.error('[proxy] error for', url, '-', error.message);
-    const err = new Error('Failed to proxy asset');
-    err.statusCode = 502;
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
   }
+  const error = new Error('Too many upstream redirects');
+  error.statusCode = 502;
+  throw error;
+}
+
+function limitedStream(stream, maxBytes = 20 * 1024 * 1024) {
+  let total = 0;
+  return stream.pipe(new Transform({
+    transform(chunk, encoding, callback) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        callback(Object.assign(new Error('Upstream response too large'), { statusCode: 413 }));
+        return;
+      }
+      callback(null, chunk);
+    },
+  }));
+}
+
+async function handleAssetProxy(url, timeoutMs = 10000, isHtmlGame = false) {
+  const cached = assetProxyCache.get(url);
+  if (cached) return cached;
+
+  const { upstream, targetUrl } = await fetchSafeUpstream(url, timeoutMs);
+  const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+  const declaredLength = Number(upstream.headers.get('content-length') || 0);
+  const MAX_PROXY_BYTES = 20 * 1024 * 1024;
+  if (declaredLength > MAX_PROXY_BYTES) {
+    const error = new Error('Upstream response too large');
+    error.statusCode = 413;
+    throw error;
+  }
+
+  let cacheControl = upstream.headers.get('cache-control') || 'public, max-age=3600';
+  let buffer;
+  let finalContentType = contentType;
+
+  if (contentType.includes('text/html') && isHtmlGame) {
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of limitedStream(Readable.fromWeb(upstream.body || Readable.from([])), MAX_PROXY_BYTES)) {
+      total += chunk.length;
+      chunks.push(chunk);
+    }
+    const htmlText = Buffer.concat(chunks, total).toString('utf8');
+    const $ = cheerio.load(htmlText);
+    adblock.stripAds($, targetUrl.toString(), PUBLIC_BASE_URL);
+    rewriteAssetUrls($, targetUrl.toString());
+    const swGuardTag = `<script>try{if(navigator.serviceWorker){navigator.serviceWorker.register=function(){return Promise.reject(new Error('service worker disabled'));};}}catch(e){}</script>`;
+    $('head').prepend(swGuardTag);
+    $('head').append(`<script src="${PUBLIC_BASE_URL}/adblock-runtime.js"></script>`);
+    buffer = Buffer.from($.html(), 'utf8');
+    finalContentType = 'text/html; charset=utf-8';
+    cacheControl = 'no-cache';
+  } else if (contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
+    const chunks = []; let total = 0;
+    for await (const chunk of limitedStream(Readable.fromWeb(upstream.body || Readable.from([])), MAX_PROXY_BYTES)) { total += chunk.length; chunks.push(chunk); }
+    buffer = Buffer.concat(chunks, total);
+    finalContentType = 'application/javascript; charset=utf-8';
+  } else if (contentType.includes('text/css')) {
+    const chunks = []; let total = 0;
+    for await (const chunk of limitedStream(Readable.fromWeb(upstream.body || Readable.from([])), MAX_PROXY_BYTES)) { total += chunk.length; chunks.push(chunk); }
+    const cssText = Buffer.concat(chunks, total).toString('utf8');
+    buffer = Buffer.from(rewriteCssUrls(cssText, targetUrl.toString()), 'utf8');
+    finalContentType = 'text/css; charset=utf-8';
+    cacheControl = 'no-cache';
+  } else {
+    return { stream: limitedStream(Readable.fromWeb(upstream.body), MAX_PROXY_BYTES), contentType: finalContentType, cacheControl };
+  }
+
+  const result = { buffer, contentType: finalContentType, cacheControl };
+  assetProxyCache.set(url, result);
+  return result;
 }
 
 function sendProxyResult(result, res) {
@@ -563,7 +552,7 @@ function rewriteCssUrls(cssText, baseUrl) {
 }
 
 // ─── Routes ──────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('🎮 Playvora Gaming Server running 🚀'));
+app.get('/', (req, res) => res.send('🦈 SHARX Gaming Server running 🚀'));
 
 app.use('/user', userRoutes);
 app.use('/auth', authRoutes);
@@ -792,15 +781,10 @@ app.get("/games/:id", async (req, res) => {
   try {
     const games = await getGames();
 
-    console.log("Requested ID:", req.params.id);
-    console.log("Games length:", games.length);
 
     const game = games.find((g) => g.id === req.params.id);
 
-    console.log("Found:", !!game);
-
     if (!game) {
-      console.log("First 5 IDs:", games.slice(0, 5).map(g => g.id));
       return res.status(404).json({
         error: "Game not found",
       });
@@ -843,15 +827,16 @@ app.get('/stats', (req, res) => {
 // ─── Signup ──────────────────────────────────────────────────
 app.post('/signup', authLimiter, async (req, res) => {
   try {
-    const { name, email, password } = req.body;
-    if (!name || typeof name !== 'string' || !name.trim()) {
+    const { name, password } = req.body;
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!name || typeof name !== 'string' || !name.trim() || name.trim().length > 100) {
       return res.status(400).json({ message: 'Name is required' });
     }
     if (!isValidEmail(email)) {
       return res.status(400).json({ message: 'A valid email is required' });
     }
-    if (!password || typeof password !== 'string' || password.length < 6) {
-      return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    if (!password || typeof password !== 'string' || password.length < 12) {
+      return res.status(400).json({ message: 'Password must be at least 12 characters' });
     }
 
     const existing = await prisma.user.findUnique({ where: { email } });
@@ -889,9 +874,7 @@ app.post('/login', authLimiter, async (req, res) => {
     const match = await bcrypt.compare(password, user.password);
     if (!match) return res.status(400).json({ message: 'Invalid email or password' });
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, {
-      expiresIn: '1d',
-    });
+    const token = signAccessToken(user, '1d');
     res.json({ message: 'Login successful', token });
   } catch (error) {
     console.error('Login error:', error);
@@ -902,85 +885,87 @@ app.post('/login', authLimiter, async (req, res) => {
 // ─── Forgot Password ────────────────────────────────────────
 app.post('/forgot-password', otpLimiter, async (req, res) => {
   try {
-    const { email } = req.body;
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ message: 'Valid email required' });
-    }
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (!isValidEmail(email)) return res.status(400).json({ message: 'Valid email required' });
 
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.json({ message: 'If that account exists, an OTP has been sent' });
+    const generic = { message: 'If that account exists, an OTP has been sent' };
+    if (!user) return res.json(generic);
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore.set(email, { otp, expires: Date.now() + OTP_EXPIRY_MS });
+    const otp = String(randomInt(100000, 1000000));
+    const codeHash = hashCode(otp);
+    await prisma.$transaction([
+      prisma.passwordResetCode.deleteMany({ where: { userId: user.id, usedAt: null } }),
+      prisma.passwordResetCode.create({
+        data: { userId: user.id, codeHash, expiresAt: new Date(Date.now() + 10 * 60 * 1000) },
+      }),
+    ]);
 
     await resend.emails.send({
-      from: 'Playvora <onboarding@resend.dev>',
+      from: 'SHARX <onboarding@resend.dev>',
       to: email,
-      subject: 'Reset your Playvora password',
+      subject: 'Reset your SHARX password',
       html: getOtpEmailHtml(otp, user.name),
     });
-
-    res.json({ message: 'If that account exists, an OTP has been sent' });
+    return res.json(generic);
   } catch (error) {
     console.error('Forgot password error:', error);
-    res.status(500).json({ message: 'Error sending email' });
+    return res.status(500).json({ message: 'Error sending email' });
   }
 });
 
 // ─── Verify OTP ─────────────────────────────────────────────
 app.post('/verify-otp', otpLimiter, async (req, res) => {
   try {
-    const { email, otp } = req.body;
-    if (!email || !otp) {
-      return res.status(400).json({ message: 'Email and OTP are required' });
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const otp = typeof req.body?.otp === 'string' ? req.body.otp.trim() : '';
+    if (!isValidEmail(email) || !/^\d{6}$/.test(otp)) return res.status(400).json({ message: 'Invalid or expired OTP.' });
+
+    const user = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+    if (!user) return res.status(400).json({ message: 'Invalid or expired OTP.' });
+    const code = await prisma.passwordResetCode.findFirst({ where: { userId: user.id, usedAt: null, expiresAt: { gt: new Date() }, attempts: { lt: 5 } }, orderBy: { createdAt: 'desc' } });
+    if (!code) return res.status(400).json({ message: 'Invalid or expired OTP.' });
+    if (code.codeHash !== hashCode(otp)) {
+      await prisma.passwordResetCode.update({ where: { id: code.id }, data: { attempts: { increment: 1 } } });
+      return res.status(400).json({ message: 'Invalid or expired OTP.' });
     }
-    const stored = otpStore.get(email);
-    if (!stored) {
-      return res.status(400).json({ message: 'OTP not found. Request again.' });
-    }
-    if (Date.now() > stored.expires) {
-      otpStore.delete(email);
-      return res.status(400).json({ message: 'OTP expired. Request again.' });
-    }
-    if (stored.otp !== otp) {
-      return res.status(400).json({ message: 'Invalid OTP.' });
-    }
-    res.json({ message: 'OTP verified' });
+    return res.json({ message: 'OTP verified' });
   } catch (error) {
     console.error('OTP verify error:', error);
-    res.status(500).json({ message: 'Verification error' });
+    return res.status(500).json({ message: 'Verification error' });
   }
 });
 
 // ─── Reset Password ─────────────────────────────────────────
 app.post('/reset-password', otpLimiter, async (req, res) => {
   try {
-    const { email, otp, newPassword } = req.body;
-    if (!email || !otp) {
-      return res.status(400).json({ message: 'Invalid or expired OTP.' });
-    }
-    const stored = otpStore.get(email);
-    if (!stored || stored.otp !== otp || Date.now() > stored.expires) {
-      return res.status(400).json({ message: 'Invalid or expired OTP.' });
-    }
-    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
-      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const otp = typeof req.body?.otp === 'string' ? req.body.otp.trim() : '';
+    const newPassword = req.body?.newPassword;
+    if (!isValidEmail(email) || !/^\d{6}$/.test(otp) || typeof newPassword !== 'string' || newPassword.length < 12 || newPassword.length > 200) {
+      return res.status(400).json({ message: 'Invalid reset request.' });
     }
 
-    const hashed = await bcrypt.hash(newPassword, 10);
-    await prisma.user.update({
-      where: { email },
-      data: { password: hashed },
-    });
-    otpStore.delete(email);
+    const user = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+    if (!user) return res.status(400).json({ message: 'Invalid or expired OTP.' });
 
-    res.json({ message: 'Password reset successful' });
+    const code = await prisma.passwordResetCode.findFirst({ where: { userId: user.id, usedAt: null, expiresAt: { gt: new Date() }, attempts: { lt: 5 } }, orderBy: { createdAt: 'desc' } });
+    if (!code || code.codeHash !== hashCode(otp)) {
+      if (code) await prisma.passwordResetCode.update({ where: { id: code.id }, data: { attempts: { increment: 1 } } });
+      return res.status(400).json({ message: 'Invalid or expired OTP.' });
+    }
+
+    const bcryptHash = await bcrypt.hash(newPassword, 12);
+    await prisma.$transaction([
+      prisma.user.update({ where: { id: user.id }, data: { password: bcryptHash, tokenVersion: { increment: 1 } } }),
+      prisma.passwordResetCode.update({ where: { id: code.id }, data: { usedAt: new Date() } }),
+      prisma.passwordResetCode.deleteMany({ where: { userId: user.id, id: { not: code.id } } }),
+    ]);
+
+    return res.json({ message: 'Password reset successful' });
   } catch (error) {
-    if (error.code === 'P2025') {
-      return res.status(400).json({ message: 'Account no longer exists' });
-    }
     console.error('Reset password error:', error);
-    res.status(500).json({ message: 'Reset error' });
+    return res.status(500).json({ message: 'Reset error' });
   }
 });
 
@@ -998,10 +983,11 @@ app.get('/profile', authMiddleware, async (req, res) => {
 });
 
 // ─── Play / Record Match ────────────────────────────────────
-app.post('/play', authMiddleware, async (req, res) => {
+const playLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+app.post('/play', playLimiter, authMiddleware, async (req, res) => {
   try {
     const { result, score } = req.body;
-    const MAX_SCORE_PER_MATCH = 100000;
+    const MAX_SCORE_PER_MATCH = 10000;
     if (
       typeof score !== 'number' ||
       !Number.isFinite(score) ||
@@ -1014,14 +1000,15 @@ app.post('/play', authMiddleware, async (req, res) => {
       return res.status(400).json({ message: 'Invalid result' });
     }
 
-    const match = await prisma.match.create({
-      data: { result, score, userId: req.user.id },
-    });
-
-    await prisma.user.update({
-      where: { id: req.user.id },
-      data: { score: { increment: score } },
-    });
+    const [match] = await prisma.$transaction([
+      prisma.match.create({
+        data: { result: result.trim(), score, userId: req.user.id },
+      }),
+      prisma.user.update({
+        where: { id: req.user.id },
+        data: { score: { increment: score } },
+      }),
+    ]);
 
     const topPlayers = await prisma.user.findMany({
       orderBy: { score: 'desc' },
@@ -1119,7 +1106,9 @@ app.post('/contact', contactLimiter, async (req, res) => {
 
 adblock.mountAdBlockRuntime(app, PUBLIC_BASE_URL);
 
-app.get('/proxy/game', async (req, res) => {
+const proxyLimiter = rateLimit({ windowMs: 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many proxy requests. Please slow down.' } });
+
+app.get('/proxy/game', proxyLimiter, async (req, res) => {
   const { url } = req.query;
 
   if (!url || url === 'undefined' || url === 'null') {
@@ -1127,7 +1116,6 @@ app.get('/proxy/game', async (req, res) => {
   }
 
   try {
-    lastProxiedGameUrl = url;
     const result = await handleAssetProxy(url, 15000, true);
 
     res.set({
@@ -1137,6 +1125,7 @@ app.get('/proxy/game', async (req, res) => {
       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Accept',
       'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https: wss:; font-src 'self' data:; frame-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://sharx.in;",
     });
 
     return sendProxyResult(result, res);
@@ -1148,7 +1137,7 @@ app.get('/proxy/game', async (req, res) => {
   }
 });
 
-app.get('/proxy/asset', async (req, res) => {
+app.get('/proxy/asset', proxyLimiter, async (req, res) => {
   let { url } = req.query;
 
   if (!url || url === 'undefined' || url === 'null') {
@@ -1184,9 +1173,9 @@ app.get('/proxy/asset', async (req, res) => {
   }
 });
 
-app.get(/^\/proxy\/(.+)/, async (req, res) => {
+app.get(/^\/proxy\/(.+)/, proxyLimiter, async (req, res) => {
   try {
-    let gameBaseUrl = lastProxiedGameUrl;
+    let gameBaseUrl = null;
 
     const referer = req.headers.referer;
     if (referer) {
@@ -1215,6 +1204,7 @@ app.get(/^\/proxy\/(.+)/, async (req, res) => {
       'Cache-Control': result.cacheControl || 'public, max-age=3600',
       'Access-Control-Allow-Origin': '*',
       'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' https: wss:; font-src 'self' data:; frame-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://sharx.in;",
     });
 
     return sendProxyResult(result, res);
