@@ -7,6 +7,7 @@ const prisma = require('../lib/prisma');
 const router = express.Router();
 const oauthLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
 const exchangeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const OAUTH_CODE_TTL_MS = 60 * 1000;
 
 function parseCookie(header, name) {
@@ -16,20 +17,27 @@ function parseCookie(header, name) {
 
 function issueOAuthState(res) {
   const state = randomCode(24);
+
   res.cookie('sharx_oauth_state', state, {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: OAUTH_CODE_TTL_MS,
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    maxAge: OAUTH_STATE_TTL_MS,
     path: '/auth',
   });
+
   return state;
 }
 
 function verifyOAuthState(req, res) {
   const expected = parseCookie(req.headers.cookie, 'sharx_oauth_state');
   const supplied = typeof req.query.state === 'string' ? req.query.state : '';
-  res.clearCookie('sharx_oauth_state', { path: '/auth' });
+  res.clearCookie('sharx_oauth_state', {
+    path: '/auth',
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+  });
   return Boolean(expected && supplied && expected === supplied);
 }
 
