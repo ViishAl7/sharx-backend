@@ -49,17 +49,29 @@ model User {
   currentChallenge          String?
   currentChallengeExpiresAt DateTime?
 
+  // Existing game/match data
   matches Match[]
 
+  // Reward system
   rewardWallet     RewardWallet?
   rewardSessions   RewardSession[]
   rewardLedger     RewardLedger[]
   rewardMilestones RewardMilestone[]
-  referralsMade    Referral[]        @relation("Referrer")
-  referralReceived Referral?         @relation("Referred")
-  withdrawals      Withdrawal[]
+
+  // Referrals
+  referralsMade    Referral[] @relation("Referrer")
+  referralReceived Referral?  @relation("Referred")
+
+  // Withdrawals
+  withdrawals Withdrawal[]
+
+  // Authentication / account recovery
   passwordResetCodes PasswordResetCode[]
   authExchangeCodes AuthExchangeCode[]
+
+  // Persistent game data
+  gameHistory  GameHistory[]
+  gameProgress GameProgress[]
 }
 
 model Match {
@@ -68,19 +80,56 @@ model Match {
   score     Int
   createdAt DateTime @default(now())
   userId    Int
-  user      User     @relation(fields: [userId], references: [id])
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+model GameHistory {
+  id              Int      @id @default(autoincrement())
+  userId          Int
+  gameId          String
+  gameName        String?
+  lastPlayedAt    DateTime @default(now())
+  playCount       Int      @default(1)
+  totalPlaySeconds Int     @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, gameId])
+  @@index([userId, lastPlayedAt])
+}
+
+model GameProgress {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  gameId    String
+  progress  Json
+  score     Int?
+  level     Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, gameId])
+  @@index([userId, updatedAt])
 }
 
 model RewardWallet {
   id                     Int      @id @default(autoincrement())
   userId                 Int      @unique
-  balancePaise           BigInt   @default(0)
-  lifetimeEarnedPaise    BigInt   @default(0)
-  lifetimeWithdrawnPaise BigInt   @default(0)
-  createdAt              DateTime @default(now())
-  updatedAt              DateTime @updatedAt
+  balancePaise            BigInt   @default(0)
+  lifetimeEarnedPaise     BigInt   @default(0)
+  lifetimeWithdrawnPaise  BigInt   @default(0)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 
   user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   ledger      RewardLedger[]
   withdrawals Withdrawal[]
 }
@@ -98,7 +147,8 @@ model RewardLedger {
   createdAt         DateTime         @default(now())
 
   wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([walletId, createdAt])
@@ -108,17 +158,17 @@ model RewardSession {
   id                 String              @id @default(cuid())
   userId             Int
   gameId             String
-  status             RewardSessionStatus @default(ACTIVE)
-  startedAt          DateTime            @default(now())
-  lastHeartbeatAt    DateTime            @default(now())
+  status             RewardSessionStatus  @default(ACTIVE)
+  startedAt          DateTime             @default(now())
+  lastHeartbeatAt    DateTime             @default(now())
   endedAt            DateTime?
   qualifiedSeconds   Int                 @default(0)
   rewardedMilestones Int                 @default(0)
   clientInstanceId   String
   ipHash             String?
   userAgentHash      String?
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -134,21 +184,23 @@ model RewardMilestone {
   rewardPaise      Int
   referenceKey     String   @unique
   createdAt        DateTime @default(now())
-  user             User     @relation(fields: [userId], references: [id])
+
+  user User @relation(fields: [userId], references: [id])
 
   @@index([userId, createdAt])
   @@index([sessionId])
 }
 
 model Referral {
-  id             Int       @id @default(autoincrement())
+  id             Int      @id @default(autoincrement())
   referrerUserId Int
-  referredUserId Int       @unique
-  code           String    @unique
+  referredUserId Int      @unique
+  code           String   @unique
   qualifiedAt    DateTime?
-  createdAt      DateTime  @default(now())
+  createdAt      DateTime @default(now())
 
   referrer User @relation("Referrer", fields: [referrerUserId], references: [id], onDelete: Cascade)
+
   referred User @relation("Referred", fields: [referredUserId], references: [id], onDelete: Cascade)
 
   @@index([referrerUserId])
@@ -165,20 +217,21 @@ model Withdrawal {
   note        String?
   createdAt   DateTime         @default(now())
   processedAt DateTime?
-  updatedAt   DateTime @updatedAt
+  updatedAt   DateTime         @updatedAt
+
   providerPayoutId     String? @unique
   providerFundAccountId String?
   providerReferenceId  String?
   idempotencyKey       String? @unique
-  failureReason       String?
+  failureReason        String?
 
   wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([status, createdAt])
 }
-
 
 model PasswordResetCode {
   id        String   @id @default(cuid())

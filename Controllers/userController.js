@@ -93,5 +93,207 @@ const getHistory = async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 };
+// POST /user/games/:gameId/play
+// Records that the authenticated user played a game.
+const recordGamePlay = async (req, res) => {
+  const { gameId } = req.params;
+  const { gameName, playSeconds = 0 } = req.body || {};
 
-module.exports = { getProfile, updateProfile, getHistory };
+  if (!gameId || typeof gameId !== "string" || gameId.length > 200) {
+    return res.status(400).json({ message: "Invalid gameId" });
+  }
+
+  const seconds = Number(playSeconds);
+
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > 86400) {
+    return res.status(400).json({ message: "Invalid playSeconds" });
+  }
+
+  if (
+    gameName !== undefined &&
+    gameName !== null &&
+    (typeof gameName !== "string" || gameName.length > 300)
+  ) {
+    return res.status(400).json({ message: "Invalid gameName" });
+  }
+
+  try {
+    const history = await prisma.gameHistory.upsert({
+      where: {
+        userId_gameId: {
+          userId: req.user.id,
+          gameId,
+        },
+      },
+      create: {
+        userId: req.user.id,
+        gameId,
+        gameName: typeof gameName === "string" ? gameName.trim() : null,
+        playCount: 1,
+        totalPlaySeconds: seconds,
+        lastPlayedAt: new Date(),
+      },
+      update: {
+        ...(typeof gameName === "string" &&
+          gameName.trim() && {
+            gameName: gameName.trim(),
+          }),
+        playCount: {
+          increment: 1,
+        },
+        totalPlaySeconds: {
+          increment: seconds,
+        },
+        lastPlayedAt: new Date(),
+      },
+    });
+
+    res.json(history);
+  } catch (err) {
+    console.error("recordGamePlay error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+// GET /user/games/history
+const getGameHistory = async (req, res) => {
+  try {
+    const history = await prisma.gameHistory.findMany({
+      where: { userId: req.user.id },
+      orderBy: { lastPlayedAt: "desc" },
+      take: 100,
+      select: {
+        id: true,
+        gameId: true,
+        gameName: true,
+        lastPlayedAt: true,
+        playCount: true,
+        totalPlaySeconds: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    res.json(history);
+  } catch (err) {
+    console.error("getGameHistory error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+// GET /user/games/:gameId/progress
+const getGameProgress = async (req, res) => {
+  const { gameId } = req.params;
+
+  if (!gameId || typeof gameId !== "string" || gameId.length > 200) {
+    return res.status(400).json({ message: "Invalid gameId" });
+  }
+
+  try {
+    const progress = await prisma.gameProgress.findUnique({
+      where: {
+        userId_gameId: {
+          userId: req.user.id,
+          gameId,
+        },
+      },
+      select: {
+        gameId: true,
+        progress: true,
+        score: true,
+        level: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    if (!progress) {
+      return res.status(404).json({ message: "No saved progress found" });
+    }
+
+    res.json(progress);
+  } catch (err) {
+    console.error("getGameProgress error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+// PUT /user/games/:gameId/progress
+const saveGameProgress = async (req, res) => {
+  const { gameId } = req.params;
+  const { progress, score, level } = req.body || {};
+
+  if (!gameId || typeof gameId !== "string" || gameId.length > 200) {
+    return res.status(400).json({ message: "Invalid gameId" });
+  }
+
+  if (
+    progress === undefined ||
+    progress === null ||
+    typeof progress !== "object" ||
+    Array.isArray(progress)
+  ) {
+    return res.status(400).json({ message: "progress must be a JSON object" });
+  }
+
+  if (
+    score !== undefined &&
+    score !== null &&
+    (!Number.isInteger(score) || score < 0)
+  ) {
+    return res.status(400).json({ message: "Invalid score" });
+  }
+
+  if (
+    level !== undefined &&
+    level !== null &&
+    (!Number.isInteger(level) || level < 0)
+  ) {
+    return res.status(400).json({ message: "Invalid level" });
+  }
+
+  try {
+    const saved = await prisma.gameProgress.upsert({
+      where: {
+        userId_gameId: {
+          userId: req.user.id,
+          gameId,
+        },
+      },
+      create: {
+        userId: req.user.id,
+        gameId,
+        progress,
+        score: score ?? null,
+        level: level ?? null,
+      },
+      update: {
+        progress,
+        ...(score !== undefined && { score: score ?? null }),
+        ...(level !== undefined && { level: level ?? null }),
+      },
+      select: {
+        gameId: true,
+        progress: true,
+        score: true,
+        level: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    res.json(saved);
+  } catch (err) {
+    console.error("saveGameProgress error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+module.exports = {
+  getProfile,
+  updateProfile,
+  getHistory,
+  recordGamePlay,
+  getGameHistory,
+  getGameProgress,
+  saveGameProgress,
+};
