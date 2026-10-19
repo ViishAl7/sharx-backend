@@ -1,3 +1,4 @@
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -67,11 +68,21 @@ model User {
 
   // Authentication / account recovery
   passwordResetCodes PasswordResetCode[]
-  authExchangeCodes AuthExchangeCode[]
+  authExchangeCodes  AuthExchangeCode[]
 
   // Persistent game data
   gameHistory  GameHistory[]
   gameProgress GameProgress[]
+
+  // In-app notifications
+  notifications Notification[]
+
+  // Community
+  communityPosts     CommunityPost[]
+  communityComments  CommunityComment[]
+  communityLikes     CommunityLike[]
+  communityFollowing CommunityFollow[] @relation("CommunityFollower")
+  communityFollowers CommunityFollow[] @relation("CommunityFollowing")
 }
 
 model Match {
@@ -87,15 +98,15 @@ model Match {
 }
 
 model GameHistory {
-  id              Int      @id @default(autoincrement())
-  userId          Int
-  gameId          String
-  gameName        String?
-  lastPlayedAt    DateTime @default(now())
-  playCount       Int      @default(1)
-  totalPlaySeconds Int     @default(0)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id               Int      @id @default(autoincrement())
+  userId           Int
+  gameId           String
+  gameName         String?
+  lastPlayedAt     DateTime @default(now())
+  playCount        Int      @default(1)
+  totalPlaySeconds Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -120,16 +131,15 @@ model GameProgress {
 }
 
 model RewardWallet {
-  id                     Int      @id @default(autoincrement())
-  userId                 Int      @unique
-  balancePaise            BigInt   @default(0)
-  lifetimeEarnedPaise     BigInt   @default(0)
-  lifetimeWithdrawnPaise  BigInt   @default(0)
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
+  id                    Int      @id @default(autoincrement())
+  userId                Int      @unique
+  balancePaise           BigInt   @default(0)
+  lifetimeEarnedPaise    BigInt   @default(0)
+  lifetimeWithdrawnPaise BigInt   @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-
   ledger      RewardLedger[]
   withdrawals Withdrawal[]
 }
@@ -147,8 +157,7 @@ model RewardLedger {
   createdAt         DateTime         @default(now())
 
   wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([walletId, createdAt])
@@ -158,17 +167,17 @@ model RewardSession {
   id                 String              @id @default(cuid())
   userId             Int
   gameId             String
-  status             RewardSessionStatus  @default(ACTIVE)
-  startedAt          DateTime             @default(now())
-  lastHeartbeatAt    DateTime             @default(now())
+  status             RewardSessionStatus @default(ACTIVE)
+  startedAt          DateTime            @default(now())
+  lastHeartbeatAt    DateTime            @default(now())
   endedAt            DateTime?
   qualifiedSeconds   Int                 @default(0)
   rewardedMilestones Int                 @default(0)
   clientInstanceId   String
   ipHash             String?
   userAgentHash      String?
-  createdAt          DateTime             @default(now())
-  updatedAt          DateTime             @updatedAt
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -200,7 +209,6 @@ model Referral {
   createdAt      DateTime @default(now())
 
   referrer User @relation("Referrer", fields: [referrerUserId], references: [id], onDelete: Cascade)
-
   referred User @relation("Referred", fields: [referredUserId], references: [id], onDelete: Cascade)
 
   @@index([referrerUserId])
@@ -226,8 +234,7 @@ model Withdrawal {
   failureReason        String?
 
   wallet RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
   @@index([status, createdAt])
@@ -254,6 +261,7 @@ model AuthExchangeCode {
   codeHash  String   @unique
   expiresAt DateTime
   usedAt    DateTime?
+  isNewUser Boolean  @default(false)
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -269,4 +277,79 @@ model WebhookEvent {
   createdAt   DateTime @default(now())
 
   @@index([provider, createdAt])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    Int
+  type      String
+  title     String
+  body      String
+  data      Json?
+  dedupeKey String?   @unique
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+// Community posts
+model CommunityPost {
+  id        String   @id @default(cuid())
+  authorId  Int
+  content   String   @default("") @db.VarChar(2000)
+  mediaUrl  String?  @db.VarChar(2048)
+  mediaType String?  @db.VarChar(10)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  author   User              @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments CommunityComment[]
+  likes    CommunityLike[]
+
+  @@index([createdAt, id])
+  @@index([authorId, createdAt])
+}
+
+model CommunityComment {
+  id        String   @id @default(cuid())
+  postId    String
+  authorId  Int
+  content   String   @db.VarChar(1000)
+  createdAt DateTime @default(now())
+
+  post   CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@index([authorId, createdAt])
+}
+
+model CommunityLike {
+  id        String   @id @default(cuid())
+  postId    String
+  userId    Int
+  createdAt DateTime @default(now())
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([postId, userId])
+  @@index([userId, createdAt])
+}
+
+model CommunityFollow {
+  id          String   @id @default(cuid())
+  followerId  Int
+  followingId Int
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("CommunityFollower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("CommunityFollowing", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@unique([followerId, followingId])
+  @@index([followingId, createdAt])
 }

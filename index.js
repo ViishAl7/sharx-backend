@@ -51,6 +51,11 @@ const authRoutes = require('./routes/auth');
 const rewardRoutes = require('./routes/rewards');
 const withdrawalRoutes = require('./routes/withdrawals');
 const referralRoutes = require('./routes/referrals');
+const notificationRoutes = require('./routes/notifications');
+const communityRoutes = require('./routes/community');
+const { disconnectUser } = require('./lib/realtime');
+const { registerSocketHandlers } = require('./lib/socketHandlers');
+const { createNotification } = require('./services/notificationService');
 require('./Controllers/authController'); // side-effects (passport config)
 
 // ─── Required env vars — fail fast with a clear message ────
@@ -171,23 +176,7 @@ const io = new Server(server, {
   },
 });
 
-io.on('connection', (socket) => {
-  console.log('User connected 🔥');
-
-  socket.on('joinRoom', (roomId) => {
-    if (typeof roomId !== 'string' || roomId.length === 0 || roomId.length > 100) return;
-    socket.join(roomId);
-  });
-
-  socket.on('makeMove', ({ roomId, board, player } = {}) => {
-    if (typeof roomId !== 'string' || roomId.length === 0 || roomId.length > 100) return;
-    socket.to(roomId).emit('moveMade', { board, player });
-  });
-
-  socket.on('disconnect', () => {
-    console.log('User disconnected 💤');
-  });
-});
+registerSocketHandlers(io);
 
 // ─── Email Template ─────────────────────────────────────────
 function escapeHtml(str) {
@@ -560,6 +549,8 @@ app.use('/passkey', passkeyRoutes);
 app.use('/rewards', rewardRoutes);
 app.use('/withdrawals', withdrawalRoutes);
 app.use('/referrals', referralRoutes);
+app.use('/notifications', notificationRoutes);
+app.use('/community', communityRoutes);
 
 // ════════════════════════════════════════════════════════════════
 //  🎮 GAMES — multi-page parallel fetch, cached, filterable
